@@ -1,0 +1,36 @@
+# ===== Keil MDK 编译产物 =====
+Objects/
+Listings/
+DebugConfig/
+*.axf
+*.hex
+*.bin
+*.map
+*.lst
+*.dep
+*.sct
+*.lnp
+*.bak
+*.dep
+*.o
+*.d
+*.crf
+*.iex
+*.htm
+
+# ===== Keil 用户工程临时文件（每人本地不同，不入库）=====
+*.uvguix.*
+*.uvoptx
+*.uvgui.*
+JLinkLog.txt
+JLinkSettings.ini
+*.launch
+
+# ===== STM32CubeMX 生成的临时备份 =====
+*.bak
+*.~
+*.tmp
+
+# ===== 其他 =====
+.DS_Store
+Thumbs.db

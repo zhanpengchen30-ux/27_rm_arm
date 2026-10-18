@@ -1,0 +1,7 @@
+--cpu Cortex-M7.fp.dp -g --apcs=interwork -I ../Core/Inc -I ../Drivers/CMSIS/Include
+-I.\RTE\_h723_cloud
+-ID:\Keil\Packs\ARM\CMSIS\5.8.0\CMSIS\Core\Include
+-ID:\Keil\Packs\ARM\CMSIS\5.8.0\CMSIS\DSP\Include
+-ID:\Keil\Packs\ARM\CMSIS\5.8.0\CMSIS\DSP\PrivateInclude
+--pd "__UVISION_VERSION SETA 536" --pd "_RTE_ SETA 1" --pd "STM32H723xx SETA 1" --pd "_RTE_ SETA 1"
+--list startup_stm32h723xx.lst --xref -o h723_cloud\startup_stm32h723xx.o --depend h723_cloud\startup_stm32h723xx.d "startup_stm32h723xx.s"

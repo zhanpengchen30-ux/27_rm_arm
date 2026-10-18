@@ -2,7 +2,9 @@
 #include <string.h>
 #include "bsp_dwt.h"
 #include "usart.h"
-#include "bsp_dr16.h" // 接入大疆遥控器
+#include "bsp_dr16.h"
+#include "dm_motor.h"
+#include "cmsis_os2.h"
 
 static uint8_t zigbee_rx_byte;
 static Arm_t arm;
@@ -12,16 +14,44 @@ static uint8_t zigbee_idx = 0;
 #define GRIPPER_OPEN_POS    0.0f    // rad
 #define GRIPPER_CLOSE_POS   2.0f    // rad
 
-#define JOINT_MAX_VEL       1.5f    
-#define JOINT_CUR           0.0f    
-#define GRIPPER_CUR         0.0f    
+#define JOINT_MAX_VEL       2.0f    // 关节最大运行角速度 rad/s
+#define GRIPPER_CUR         1.0f    // 夹爪闭环电流
 
+// ==================== 1. 各关节标定表、限位与电流限幅 ====================
+
+// 关节主从方向映射：J2 经过实测必须为 -1.0f（向上抬），其他关节若反向直接改负号
+static const float ARM_DIR[ARM_JOINT_NUM] = {
+    1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f
+};
+
+// 关节机械软限位（单位 rad，保护机构防止撞车身/打限位/绞线）
+static const float ARM_Q_MIN[ARM_JOINT_NUM] = {-2.80f, -1.20f, -2.80f, -2.60f, -2.80f, -2.80f};
+static const float ARM_Q_MAX[ARM_JOINT_NUM] = { 2.80f,  1.20f,  2.80f,  2.60f,  2.80f,  2.80f};
+
+// 各关节闭环出力电流上限（绝不能为 0！J2 大臂需要抗重力给 1.8A，其他给 1.0~1.2A）
+static const float ARM_CUR_LIMIT[ARM_JOINT_NUM] = {
+    1.2f,  // J1: 4340 底座偏航
+    1.8f,  // J2: J8009 大臂俯仰（托举整臂重力）
+    1.5f,  // J3: 4340 小臂俯仰
+    1.0f,  // J4: 4310 腕部翻滚
+    1.0f,  // J5: 4310 腕部俯仰
+    1.0f   // J6: 6220 腕部偏航
+};
+
+static float Arm_ClampJoint(int i, float v)
+{
+    if(v < ARM_Q_MIN[i]) return ARM_Q_MIN[i];
+    if(v > ARM_Q_MAX[i]) return ARM_Q_MAX[i];
+    return v;
+}
+
+// ==================== 2. 初始化 ====================
 void Arm_Init(void)
 {
-    // 1. 彻底补全电机的 q_max、dq_max 和 can_id 参数
-    DM_Motor_Init(); 
+    // 1. 初始化电机驱动底层结构体
+    DM_Motor_Init();
 
-    // 2. 保持原有的收发器供电使能 ...
+    // 2. 开启板载 5V 电源（给 CAN 收发器供电）
     __HAL_RCC_GPIOC_CLK_ENABLE();
     GPIO_InitTypeDef GPIO_InitStruct = {0};
     GPIO_InitStruct.Pin = GPIO_PIN_15 | GPIO_PIN_14;
@@ -42,7 +72,7 @@ void Arm_Init(void)
     HAL_UART_Receive_IT(&huart10, &zigbee_rx_byte, 1);
 }
 
-// 修复：修正字节解析偏移
+// ==================== 3. 串口解析（主手数据） ====================
 void Arm_Zigbee_ParseByte(uint8_t byte)
 {
     zigbee_buf[zigbee_idx++] = byte;
@@ -57,7 +87,6 @@ void Arm_Zigbee_ParseByte(uint8_t byte)
     {
         if(zigbee_buf[ZIGBEE_FRAME_LEN - 1] == ZIGBEE_TAIL)
         {
-            // 修复：数据段从索引 1 开始，每次 +2
             for(int i = 0; i < ARM_JOINT_NUM; i++)
             {
                 int16_t angle_raw = (int16_t)(zigbee_buf[1 + i*2] | (zigbee_buf[2 + i*2] << 8));
@@ -86,8 +115,7 @@ static void Arm_ReadSwitches(void)
     // 自定义按键读取预留
 }
 
-// 夹爪控制
-// ARM_USE_GRIPPER = 0 时整段不参与编译：既不读 GPIO，也不给夹爪电机下发任何帧
+// ==================== 4. 夹爪控制 ====================
 #if ARM_USE_GRIPPER
 static void Arm_ControlGripper(void)
 {
@@ -112,7 +140,7 @@ static void Arm_ControlGripper(void)
         DM_Motor_t *g = DM_Motor_Get(DM_MOTOR_NUM - 1);
         if(g && g->rx_cnt > 0)
         {
-            pos = g->position; // 开机未操作时保持当前
+            pos = g->position;
         }
     }
 
@@ -121,158 +149,125 @@ static void Arm_ControlGripper(void)
 #else
 static void Arm_ControlGripper(void)
 {
-    // 夹爪未上机，空实现
+    // 夹爪未启用，空实现
 }
 #endif
 
-// ---------------- 主从跟随用的标定表 ----------------
-
-// 关节机械行程（单位 rad）——必须按真机实测替换！下面是占位值，直接上电会顶到硬限位
-static const float ARM_Q_MIN[ARM_JOINT_NUM] = {-2.80f, -1.20f, -2.80f, -2.60f, -2.80f, -2.80f};
-static const float ARM_Q_MAX[ARM_JOINT_NUM] = { 2.80f,  1.20f,  2.80f,  2.60f,  2.80f,  2.80f};
-
-// 主从方向映射：+1 同向，-1 反向
-// 第一次联调时逐关节试，哪个反着走就把对应位改成 -1，不用动主手代码
-static const float ARM_DIR[ARM_JOINT_NUM] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
-
-static float Arm_ClampJoint(int i, float v)
-{
-    if(v < ARM_Q_MIN[i]) return ARM_Q_MIN[i];
-    if(v > ARM_Q_MAX[i]) return ARM_Q_MAX[i];
-    return v;
-}
-
-// 修复：全面打通大疆遥控器状态机
+// ==================== 5. 核心状态机与安全离合 ====================
 static void Arm_UpdateState(void)
 {
     const DR16_Data_t *rc = DR16_Get_Data();
 
-    // 1. 遥控器离线检测（遥控器一关，强制彻底失能）
+    // 1. 遥控器安全断连检测
     if(!DR16_IsOnline())
     {
         arm.state = ARM_STATE_DISABLED;
     }
     else
     {
-        // 2. 检查遥控器右拨杆 s[0]
-        if(rc->rc.s[0] == DR16_SW_DOWN) // 下档：强制失能泄力
+        // 2. 遥控器右侧三档拨杆 s[0]
+        if(rc->rc.s[0] == DR16_SW_DOWN)      // 下档：强制全臂失能泄力
         {
             arm.state = ARM_STATE_DISABLED;
         }
-        else if(rc->rc.s[0] == DR16_SW_MID) // 中档：原地锁死
+        else if(rc->rc.s[0] == DR16_SW_MID) // 中档：全臂原地焊死（保命安全档）
         {
             arm.state = ARM_STATE_LOCKED;
         }
-        else if(rc->rc.s[0] == DR16_SW_UP) // 上档：允许跟随
+        else if(rc->rc.s[0] == DR16_SW_UP)  // 上档：进入主从跟随
         {
-            // 还需要 Zigbee 在线且主手 deadman 激活
             if(arm.connected && arm.active)
                 arm.state = ARM_STATE_FOLLOWING;
             else
-                arm.state = ARM_STATE_LOCKED;
+                arm.state = ARM_STATE_LOCKED; // 主手掉线自动退回锁定档
         }
     }
 
-    // 3. Zigbee 超时检测
+    // 3. Zigbee 通信超时检测
     if(arm.connected && (HAL_GetTick() - arm.last_rx_tick) > ARM_RX_TIMEOUT_MS)
     {
         arm.connected = 0;
         arm.active = 0;
     }
 
-    // 4. 硬件使能 / 失能边沿动作
+    // 4. 状态跳变动作（边沿触发）
+    const int motor_num = ARM_USE_GRIPPER ? DM_MOTOR_NUM : ARM_JOINT_NUM;
+
+    if(arm.state != arm.last_state)
     {
-        const int motor_num = ARM_USE_GRIPPER ? DM_MOTOR_NUM : ARM_JOINT_NUM;
-
-        if(arm.state != arm.last_state)
+        // 【进入使能】：从失能切入锁死/跟随
+        if(arm.last_state == ARM_STATE_DISABLED && arm.state != ARM_STATE_DISABLED)
         {
-            if(arm.last_state == ARM_STATE_DISABLED && arm.state != ARM_STATE_DISABLED)
+            // 第一遍：挨个清错
+            for(int i = 0; i < motor_num; i++)
             {
-                // 第一遍：清锁存错误（0xFB）
-                // 达妙电机有错误锁存，不清错的话发再多使能帧都不会变绿
-                for(int i = 0; i < motor_num; i++)
-                {
-                    DM_Motor_t *m = DM_Motor_Get(i);
+                DM_Motor_t *m = DM_Motor_Get(i);
+                if(m) {
                     DM_Motor_ClearError(m->hfdcan, m->can_id);
+                    osDelay(1);
                 }
+            }
+            osDelay(2);
 
-                // 第二遍：使能（0xFC）并同步初值
-                for(int i = 0; i < motor_num; i++)
-                {
-                    DM_Motor_t *m = DM_Motor_Get(i);
+            // 第二遍：挨个使能并同步当前实际位置为初始目标（核心防暴冲）
+            for(int i = 0; i < motor_num; i++)
+            {
+                DM_Motor_t *m = DM_Motor_Get(i);
+                if(m) {
                     DM_Motor_Enable(m->hfdcan, m->can_id);
                     if(i < ARM_JOINT_NUM && m->rx_cnt > 0)
                     {
-                        arm.cmd_smooth[i] = m->position; // 核心防暴冲同步
+                        arm.cmd_smooth[i] = m->position;
                     }
+                    osDelay(1);
                 }
             }
-            else if(arm.state == ARM_STATE_DISABLED)
-            {
-                // 从运行切入失能：彻底泄力
-                for(int i = 0; i < motor_num; i++)
-                {
-                    DM_Motor_t *m = DM_Motor_Get(i);
-                    DM_Motor_Disable(m->hfdcan, m->can_id);
-                }
-            }
-
-            // 5. 离合偏移不在这里捕获，见函数末尾的延迟捕获
-            arm.last_state = arm.state;
         }
-    }
-
-    // 6. 使能兜底重试
-    //    使能帧只在状态边沿发一次，万一那一帧丢了/电机当时还没上电，就永远不会亮。
-    //    这里每 200ms 检查一次：有错误位、或者根本没回包的电机，补发"清错+使能"。
-    if(arm.state == ARM_STATE_LOCKED || arm.state == ARM_STATE_FOLLOWING)
-    {
-        static uint32_t retry_tick = 0;
-        if(HAL_GetTick() - retry_tick > 200)
+        // 【进入失能】：彻底泄力
+        else if(arm.state == ARM_STATE_DISABLED)
         {
-            retry_tick = HAL_GetTick();
-            const int n = ARM_USE_GRIPPER ? DM_MOTOR_NUM : ARM_JOINT_NUM;
-            for(int i = 0; i < n; i++)
+            for(int i = 0; i < motor_num; i++)
             {
                 DM_Motor_t *m = DM_Motor_Get(i);
-                if(m->error != 0 || m->rx_cnt == 0)
-                {
-                    DM_Motor_ClearError(m->hfdcan, m->can_id);
-                    DM_Motor_Enable(m->hfdcan, m->can_id);
+                if(m) {
+                    DM_Motor_Disable(m->hfdcan, m->can_id);
+                    osDelay(1);
                 }
             }
         }
+        arm.last_state = arm.state;
     }
 
-    // 5. 离合捕获（延迟版，覆盖“使能后电机还没回包”的情况）
-    //    只有 6 个电机全部有反馈、且至少收到过一帧主手数据，才认为偏移有效。
-    //    在此之前从手保持不动，避免用假数据算出错误偏移后甩臂。
+    // 5. 离合对齐逻辑（进入跟随档时的平滑捕捉）
     if(arm.state != ARM_STATE_FOLLOWING)
     {
-        arm.q_offset_valid = 0;
+        arm.q_offset_valid = 0; // 退出跟随，偏置作废
     }
     else if(!arm.q_offset_valid)
     {
-        int ready = (arm.recv_cnt > 0);
-        for(int i = 0; i < ARM_JOINT_NUM && ready; i++)
+        // 确保所有参与跟随的关节均已建立双向反馈
+        int all_motors_online = (arm.recv_cnt > 0);
+        for(int i = 0; i < ARM_JOINT_NUM && all_motors_online; i++)
         {
             DM_Motor_t *m = DM_Motor_Get(i);
-            if(!m || m->rx_cnt == 0) ready = 0;
+            if(!m || m->rx_cnt == 0) all_motors_online = 0;
         }
 
-        if(ready)
+        if(all_motors_online)
         {
             for(int i = 0; i < ARM_JOINT_NUM; i++)
             {
                 DM_Motor_t *m = DM_Motor_Get(i);
+                // 捕获主从绝对差值：从手期望 = 主手目标 - 相对偏置
                 arm.q_offset[i]   = ARM_DIR[i] * arm.target_joint[i] - m->position;
                 arm.cmd_smooth[i] = m->position;
             }
-            arm.q_offset_valid = 1;
+            arm.q_offset_valid = 1; // 偏置锁定，开始平滑跟随
         }
     }
 }
 
+// 斜坡限速（防关节剧烈突变甩臂）
 static float Arm_RateLimit(float target, float current)
 {
     float err = target - current;
@@ -281,39 +276,62 @@ static float Arm_RateLimit(float target, float current)
     return target;
 }
 
+// ==================== 6. 机械臂控制主循环 ====================
 void Arm_ControlLoop(void)
 {
-    // 1. 自动使能：红灯时补发使能拉绿
-    static uint32_t t_en = 0;
-    if (HAL_GetTick() - t_en > 100) 
+    // 1. 刷新遥控器与整臂状态机
+    Arm_UpdateState();
+
+    // 2. 失能状态下：绝对不发任何控制帧
+    if(arm.state == ARM_STATE_DISABLED) return;
+
+    // 3. 运行中个别电机掉线/红灯的自动保活机制（只针对失能态 error==0 的电机发）
+    static uint32_t keepalive_tick = 0;
+    if(HAL_GetTick() - keepalive_tick > 200)
     {
-        t_en = HAL_GetTick();
-        for (int i = 0; i < ARM_JOINT_NUM; i++) 
+        keepalive_tick = HAL_GetTick();
+        for(int i = 0; i < ARM_JOINT_NUM; i++)
         {
             DM_Motor_t *m = DM_Motor_Get(i);
-            if (m && m->error == 0) 
+            if(m && (m->rx_cnt == 0 || m->error == 0)) 
             {
                 DM_Motor_Enable(m->hfdcan, m->can_id);
             }
         }
     }
 
-    // 2. 双管齐下控制 2 号电机 J8009（大幅度摆动测试）
-    DM_Motor_t *m2 = DM_Motor_Get(1);
-    if (m2 != NULL && m2->hfdcan != NULL && m2->error == 1) 
+    Arm_ReadSwitches();
+    Arm_ControlGripper();
+
+    // 4. 全臂 6 轴位置控制下发
+    for(int i = 0; i < ARM_JOINT_NUM; i++)
     {
-        // 目标位置：在 ±0.8 弧度之间平滑转动
-        float target_pos = 0.8f * sinf(HAL_GetTick() * 0.001f); 
+        DM_Motor_t *m = DM_Motor_Get(i);
+        if(m == NULL || m->hfdcan == NULL) continue;
 
-        // 方案 A：PVT 控制帧（给 0x302，前馈电流给 1.5A，绝不能给 0！）
-        DM_Motor_PVT_Control(m2->hfdcan, m2->can_id, target_pos, 2.0f, 1.5f);
-        osDelay(1);
+        // 仅在跟随状态、偏置已锁定且电机有反馈时计算主手跟随
+        if(arm.state == ARM_STATE_FOLLOWING && arm.q_offset_valid && m->rx_cnt > 0)
+        {
+            float raw_target = ARM_DIR[i] * arm.target_joint[i] - arm.q_offset[i];
+            float clamped_target = Arm_ClampJoint(i, raw_target);
+            arm.cmd_smooth[i] = Arm_RateLimit(clamped_target, arm.cmd_smooth[i]);
+        }
+        else
+        {
+            // 锁死档（中档）或等待对齐期间：目标恒等于当前物理位置，全臂原地焊死！
+            if(m->rx_cnt > 0)
+            {
+                arm.cmd_smooth[i] = m->position;
+            }
+        }
 
-        // 方案 B：MIT 控制帧（直发 0x02，kp=40, kd=1.5，如果电机在 MIT 模式它会立刻响应这个！）
-        DM_Motor_MIT_Control(m2->hfdcan, m2->can_id, target_pos, 0.0f, 40.0f, 1.5f, 0.0f);
+        // 下发 PVT 帧（电流限幅严格按照 ARM_CUR_LIMIT 表给足，确保有力矩！）
+        DM_Motor_PVT_Control(m->hfdcan, m->can_id,
+                             arm.cmd_smooth[i], JOINT_MAX_VEL, ARM_CUR_LIMIT[i]);
+        
+        // 关键防爆时序：每个关节下发之间间隔 1ms，防止 H7 FDCAN TX FIFO 塞爆
+        osDelay(1); 
     }
-
-    osDelay(2); // 保持控制周期
 }
 
 Arm_t* Arm_Get(void)

@@ -21,7 +21,8 @@
 #include "usart.h"
 
 /* USER CODE BEGIN 0 */
-#include "bsp_dr16.h"`r`n#include "arm.h"
+#include "bsp_dr16.h"
+#include "arm.h"
 static uint8_t zigbee_rx_byte = 0;
 /* USER CODE END 0 */
 

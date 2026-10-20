@@ -108,6 +108,16 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     }
 }
 
+// zigbee overrun/noise error recovery
+void Arm_Zigbee_RxRestart(void)
+{
+    __HAL_UART_CLEAR_OREFLAG(&huart10);
+    __HAL_UART_CLEAR_NEFLAG(&huart10);
+    __HAL_UART_CLEAR_FEFLAG(&huart10);
+    HAL_UART_AbortReceive(&huart10);
+    (void)HAL_UART_Receive_IT(&huart10, &zigbee_rx_byte, 1);
+}
+
 // ==================== 3. 初始化 ====================
 void Arm_Init(void)
 {

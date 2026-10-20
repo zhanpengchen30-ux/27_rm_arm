@@ -23,8 +23,8 @@ static const float ARM_DIR[ARM_JOINT_NUM] = {
 };
 
 // 各关节软限位（⚠️注意：J2 的最小限位根据实际机械结构设置，提前5度刹停，防止肉身撞墙堵转！）
-static const float ARM_Q_MIN[ARM_JOINT_NUM] = {-2.80f, -0.70f, -2.80f, -2.60f, -2.80f, -2.80f};
-static const float ARM_Q_MAX[ARM_JOINT_NUM] = { 2.80f,  0.50f,  2.80f,  2.60f,  2.80f,  2.80f};
+static const float ARM_Q_MIN[ARM_JOINT_NUM] = { -10.0f, -10.0f, -10.0f, -10.0f, -10.0f, -10.0f};
+static const float ARM_Q_MAX[ARM_JOINT_NUM] = { 10.0f,  10.0f,  10.0f,  10.0f,  10.0f,  10.0f};
 
 // 各关节出力电流上限（J2 大臂给 1.8A 托举，其他给 1.2A）
 static const float ARM_CUR_LIMIT[ARM_JOINT_NUM] = {

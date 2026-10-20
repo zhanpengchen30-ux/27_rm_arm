@@ -59,6 +59,7 @@ typedef struct
 
 void Arm_Init(void);
 void Arm_Zigbee_ParseByte(uint8_t byte);
+void Arm_Zigbee_RxRestart(void);
 void Arm_ControlLoop(void);
 Arm_t* Arm_Get(void);
 

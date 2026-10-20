@@ -21,7 +21,7 @@
 #include "usart.h"
 
 /* USER CODE BEGIN 0 */
-#include "bsp_dr16.h"
+#include "bsp_dr16.h"`r`n#include "arm.h"
 static uint8_t zigbee_rx_byte = 0;
 /* USER CODE END 0 */
 
@@ -586,13 +586,11 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     {
         DR16_Reset();
     }
-//		// USART10 出现错误时自动清除标志并重启接收
-//    else if (huart->Instance == USART10)
-//{
-//    HAL_UART_AbortReceive(huart);
-//    __HAL_UART_CLEAR_OREFLAG(huart);
-//    (void)HAL_UART_Receive_IT(huart, &zigbee_rx_byte, 1);
-//}
+    // USART10 zigbee overrun recovery
+    else if (huart->Instance == USART10)
+    {
+        Arm_Zigbee_RxRestart();
+    }
 }
 
 /* USER CODE END 1 */

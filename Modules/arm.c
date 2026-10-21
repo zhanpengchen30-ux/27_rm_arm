@@ -35,7 +35,7 @@ static const float ARM_Q_MIN[ARM_JOINT_NUM] = { -3.10f, -2.80f, -0.65f, -10.0f, 
 static const float ARM_Q_MAX[ARM_JOINT_NUM] = {  0.05f,  0.05f,  1.90f,  10.0f,  10.0f,  10.0f};
 
 static const float ARM_CUR_LIMIT[ARM_JOINT_NUM] = {
-    1.2f,  1.8f,  1.5f,  1.0f,  1.0f,  1.0f
+    0.7f,  0.7f,  0.7f,  0.7f,  0.7f,  0.7f
 };
 
 static float Arm_ClampJoint(int i, float v)

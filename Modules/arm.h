@@ -17,7 +17,7 @@
 #define ZIGBEE_ACTIVE_OFFSET 13   
 #define ZIGBEE_FRAME_LEN     15   
 
-#define ARM_RX_TIMEOUT_MS    200
+#define ARM_RX_TIMEOUT_MS    500
 
 #define ARM_CTRL_PERIOD_S    (0.006f)
 #define ARM_MAX_SPEED_RAD_S  (3.0f)

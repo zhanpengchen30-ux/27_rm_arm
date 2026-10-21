@@ -19,12 +19,12 @@ static uint8_t zigbee_idx = 0;
 
 // 关节方向映射：J2, J3, J4 按真机实测设为 -1.0f
 static const float ARM_DIR[ARM_JOINT_NUM] = {
-    1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f
+    1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f
 };
 
 // 各关节软限位（⚠️注意：J2 的最小限位根据实际机械结构设置，提前5度刹停，防止肉身撞墙堵转！）
-static const float ARM_Q_MIN[ARM_JOINT_NUM] = { -3.10f, -2.80f, -0.65f, -3.14f, -3.14f, -3.14f};
-static const float ARM_Q_MAX[ARM_JOINT_NUM] = { 0.05f,  0.05f,  1.90f,  3.14f,  3.14f,  3.14f};
+static const float ARM_Q_MIN[ARM_JOINT_NUM] = { -3.10f, -2.80f, -0.65f, -6.28f, -6.28f, -6.28f};
+static const float ARM_Q_MAX[ARM_JOINT_NUM] = { 0.05f,  0.05f,  1.90f,  6.28f,  6.28f,  6.28f};
 
 // 各关节出力电流上限（J2 大臂给 1.8A 托举，其他给 1.2A）
 static const float ARM_CUR_LIMIT[ARM_JOINT_NUM] = {

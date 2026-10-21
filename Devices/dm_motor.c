@@ -21,6 +21,8 @@ static float uint_to_float(uint16_t x, float x_min, float x_max, int bits)
     return (float)x * span / ((float)((1 << bits) - 1)) + x_min;
 }
 
+volatile uint32_t can_tx_fifo_full = 0;
+volatile uint32_t can_tx_fail = 0;
 // Send one CAN frame
 static void DM_CAN_Send(FDCAN_HandleTypeDef *hfdcan, uint32_t std_id, uint8_t *data)
 {
@@ -42,8 +44,8 @@ static void DM_CAN_Send(FDCAN_HandleTypeDef *hfdcan, uint32_t std_id, uint8_t *d
     }
     if(HAL_FDCAN_GetTxFifoFreeLevel(hfdcan) > 0)
     {
-        HAL_FDCAN_AddMessageToTxFifoQ(hfdcan, &txHeader, data);
-    }
+        if(HAL_FDCAN_AddMessageToTxFifoQ(hfdcan, &txHeader, data) != HAL_OK) can_tx_fail++;
+    } else { can_tx_fifo_full++; }
 }
 
 // 7 motors, types from bottom: J1=4340, J2=J8009, J3=4340, J4=4310, J5=4310, J6=6220, Gripper=4310

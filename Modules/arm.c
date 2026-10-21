@@ -12,14 +12,14 @@ Arm_t arm; // 导出供 Watch 查看
 static uint8_t zigbee_buf[32];
 static uint8_t zigbee_idx = 0;
 
-#define JOINT_MAX_VEL       2.5f    // 主从跟随最大角速度 rad/s
+#define JOINT_MAX_VEL       4.0f    // 主从跟随最大角速度 rad/s
 #define ZIGBEE_TIMEOUT_MS   200     // 主手掉线超时判定（毫秒）
 
 // ==================== 1. 主从方向映射与安全电流 ====================
 
 // 关节方向映射：J2, J3, J4 按真机实测设为 -1.0f
 static const float ARM_DIR[ARM_JOINT_NUM] = {
-    1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f
+    1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f
 };
 
 // 各关节软限位（⚠️注意：J2 的最小限位根据实际机械结构设置，提前5度刹停，防止肉身撞墙堵转！）
@@ -108,7 +108,6 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     }
 }
 
-// zigbee overrun/noise error recovery
 void Arm_Zigbee_RxRestart(void)
 {
     __HAL_UART_CLEAR_OREFLAG(&huart10);
@@ -117,6 +116,7 @@ void Arm_Zigbee_RxRestart(void)
     HAL_UART_AbortReceive(&huart10);
     (void)HAL_UART_Receive_IT(&huart10, &zigbee_rx_byte, 1);
 }
+
 
 // ==================== 3. 初始化 ====================
 void Arm_Init(void)

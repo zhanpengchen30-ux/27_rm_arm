@@ -19,8 +19,8 @@
 
 #define ARM_RX_TIMEOUT_MS    200
 
-#define ARM_CTRL_PERIOD_S    (0.002f)
-#define ARM_MAX_SPEED_RAD_S  (2.0f)
+#define ARM_CTRL_PERIOD_S    (0.006f)
+#define ARM_MAX_SPEED_RAD_S  (3.0f)
 #define ARM_MAX_STEP         (ARM_MAX_SPEED_RAD_S * ARM_CTRL_PERIOD_S)
 
 typedef enum {

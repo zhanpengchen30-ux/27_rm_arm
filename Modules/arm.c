@@ -321,7 +321,6 @@ void Arm_ControlLoop(void)
         DM_Motor_PVT_Control(m->hfdcan, m->can_id,
                              arm.cmd_smooth[i], JOINT_MAX_VEL, ARM_CUR_LIMIT[i]);
 
-        osDelay(1);
     }
 }
 

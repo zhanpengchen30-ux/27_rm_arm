@@ -27,6 +27,14 @@ volatile uint32_t zb_resync     = 0;
 volatile uint32_t zb_restart    = 0;
 volatile uint32_t zb_gap_max_ms = 0;
 
+/* Jump filter: a single frame whose target moves more than ARM_JUMP_MAX_RAD is
+   treated as a link glitch / master re-zero. It is only accepted once the next
+   frame confirms it, so the slave never lunges at full speed after a dropout. */
+#define ARM_JUMP_MAX_RAD   0.15f
+static uint8_t  arm_jump_hold[ARM_JOINT_NUM] = {0};
+static float    arm_jump_pend[ARM_JOINT_NUM] = {0};
+volatile uint32_t zb_jump_reject = 0;
+
 static const float ARM_DIR[ARM_JOINT_NUM] = {
     1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f
 };
@@ -56,7 +64,30 @@ static void Arm_DecodeFrame(uint8_t active)
     for(int i = 0; i < ARM_JOINT_NUM; i++)
     {
         int16_t angle_raw = (int16_t)(zigbee_buf[1 + i*2] | (zigbee_buf[2 + i*2] << 8));
-        arm.target_joint[i] = angle_raw * 0.001f;
+        float nq = angle_raw * 0.001f;
+        float d  = nq - arm.target_joint[i];
+
+        if(fabsf(d) <= ARM_JUMP_MAX_RAD)
+        {
+            arm.target_joint[i] = nq;
+            arm_jump_hold[i] = 0;
+        }
+        else if(arm_jump_hold[i] == 0)
+        {
+            arm_jump_pend[i] = nq;      /* suspicious: keep old target this frame */
+            arm_jump_hold[i] = 1;
+            zb_jump_reject++;
+        }
+        else if(fabsf(nq - arm_jump_pend[i]) <= ARM_JUMP_MAX_RAD)
+        {
+            arm.target_joint[i] = nq;   /* confirmed by the next frame: accept */
+            arm_jump_hold[i] = 0;
+        }
+        else
+        {
+            arm_jump_pend[i] = nq;
+            zb_jump_reject++;
+        }
     }
     arm.active = active;
     arm.connected = 1;

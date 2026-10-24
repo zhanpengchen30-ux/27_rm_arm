@@ -418,7 +418,7 @@ void Arm_ControlLoop(void)
                 uint8_t bit = (uint8_t)(1u << i);
                 DM_Motor_t *m = DM_Motor_Get(i);
                 if(m && !(heal_enable_mask & bit) &&
-                   (m->rx_cnt == 0 || m->error != 0))
+                   (m->rx_cnt == 0 || m->error != 1))
                 {
                     DM_Motor_ClearError(m->hfdcan, m->can_id);
                     heal_enable_due[i] = now + 2u;

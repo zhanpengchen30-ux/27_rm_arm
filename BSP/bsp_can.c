@@ -22,17 +22,14 @@ void BSP_FDCAN_Config(void)
     HAL_FDCAN_Start(&hfdcan1);
     HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
 
-    //FDCAN2
+    // FDCAN2 is unused. Keep it stopped: an unconnected transceiver can
+    // receive noise and generate needless RX interrupts.
     HAL_FDCAN_ConfigFilter(&hfdcan2, &sFilterConfig);
     HAL_FDCAN_ConfigGlobalFilter(&hfdcan2, FDCAN_REJECT, FDCAN_REJECT, FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE);
-    HAL_FDCAN_Start(&hfdcan2);
-    HAL_FDCAN_ActivateNotification(&hfdcan2, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
-    
-    //FDCAN3
+
+    // FDCAN3 is unused; leave it stopped for the same reason.
     HAL_FDCAN_ConfigFilter(&hfdcan3, &sFilterConfig);
     HAL_FDCAN_ConfigGlobalFilter(&hfdcan3, FDCAN_REJECT, FDCAN_REJECT, FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE);
-    HAL_FDCAN_Start(&hfdcan3);
-    HAL_FDCAN_ActivateNotification(&hfdcan3, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
 }
 
 

@@ -37,8 +37,9 @@ static void DM_CAN_Send(FDCAN_HandleTypeDef *hfdcan, uint32_t std_id, uint8_t *d
     txHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
     txHeader.MessageMarker = 0;
 
-    // TX FIFO full: wait instead of dropping
-    uint32_t timeout = 200;
+    // Do not stall the 2ms control loop behind a saturated CAN queue. The
+    // counters below expose repeated drops so bus load can be checked.
+    uint32_t timeout = 20;
     while(HAL_FDCAN_GetTxFifoFreeLevel(hfdcan) == 0 && timeout--) {
         for(volatile int i = 0; i < 20; i++);
     }

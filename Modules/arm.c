@@ -19,13 +19,19 @@ static uint8_t zigbee_idx = 0;
 #endif
 #define ZIGBEE_TIMEOUT_MS   ARM_RX_TIMEOUT_MS
 
-#define ARM_LINK_HOLD_MS    1500
 #define ARM_LIMIT_DRAG      1
+#define ARM_GAP_CATCHUP_MS  100u
+#define ARM_GAP_RECLUTCH_MS 500u
+#define ARM_CATCHUP_SPEED_RAD_S 1.5f
+static volatile uint8_t arm_catchup_mask = 0;
+static volatile uint8_t arm_reclutch_req = 0;
+static uint8_t arm_q_offset_mask = 0;
 
 volatile uint32_t zb_bad_tail   = 0;
 volatile uint32_t zb_resync     = 0;
 volatile uint32_t zb_restart    = 0;
 volatile uint32_t zb_gap_max_ms = 0;
+volatile uint32_t zb_reclutch_cnt = 0;
 
 /* Jump filter: a single frame whose target moves more than ARM_JUMP_MAX_RAD is
    treated as a link glitch / master re-zero. It is only accepted once the next
@@ -56,18 +62,31 @@ static float Arm_ClampJoint(int i, float v)
 static void Arm_DecodeFrame(uint8_t active)
 {
     uint32_t now = HAL_GetTick();
+    uint8_t long_gap = 0;
+    uint8_t reacquire = (active && !arm.active);
     if(arm.recv_cnt > 0)
     {
         uint32_t gap = now - arm.last_rx_tick;
         if(gap > zb_gap_max_ms) zb_gap_max_ms = gap;
+        if(gap > ARM_GAP_RECLUTCH_MS)
+        {
+            arm_reclutch_req = 1;
+            long_gap = 1;
+        }
+        else if(gap > ARM_GAP_CATCHUP_MS)
+        {
+            /* Use gentle catch-up until each joint reaches its target. */
+            arm_catchup_mask = (uint8_t)((1u << ARM_JOINT_NUM) - 1u);
+        }
     }
+    if(reacquire) arm_reclutch_req = 1;
     for(int i = 0; i < ARM_JOINT_NUM; i++)
     {
         int16_t angle_raw = (int16_t)(zigbee_buf[1 + i*2] | (zigbee_buf[2 + i*2] << 8));
         float nq = angle_raw * 0.001f;
         float d  = nq - arm.target_joint[i];
 
-        if(fabsf(d) <= ARM_JUMP_MAX_RAD)
+        if(long_gap || reacquire || fabsf(d) <= ARM_JUMP_MAX_RAD)
         {
             arm.target_joint[i] = nq;
             arm_jump_hold[i] = 0;
@@ -173,11 +192,29 @@ void Arm_Init(void)
     arm.state = ARM_STATE_DISABLED;
     arm.last_state = ARM_STATE_DISABLED;
     arm.q_offset_valid = 0;
+    arm_q_offset_mask = 0;
+    arm_catchup_mask = 0;
+    arm_reclutch_req = 0;
 
     HAL_UART_Receive_IT(&huart10, &zigbee_rx_byte, 1);
 }
 
 static float arm_lock_pos[ARM_JOINT_NUM] = {0};
+
+static uint8_t Arm_CaptureFollowOffset(void)
+{
+    for(int i = 0; i < ARM_JOINT_NUM; i++)
+    {
+        uint8_t bit = (uint8_t)(1u << i);
+        DM_Motor_t *m = DM_Motor_Get(i);
+        if((arm_q_offset_mask & bit) || m == NULL || m->rx_cnt == 0) continue;
+        arm.q_offset[i]   = ARM_DIR[i] * arm.target_joint[i] - m->position;
+        arm.cmd_smooth[i] = m->position;
+        arm_q_offset_mask |= bit;
+    }
+    arm.q_offset_valid = (arm_q_offset_mask == ((1u << ARM_JOINT_NUM) - 1u));
+    return arm.q_offset_valid;
+}
 
 static void Arm_UpdateState(void)
 {
@@ -199,13 +236,8 @@ static void Arm_UpdateState(void)
         }
         else if(rc->rc.s[0] == DR16_SW_UP)
         {
-            if(arm.connected)
+            if(arm.connected && arm.active)
                 arm.state = ARM_STATE_FOLLOWING;
-            else if(arm.state == ARM_STATE_FOLLOWING && arm.q_offset_valid &&
-                    (HAL_GetTick() - arm.last_rx_tick) < ARM_LINK_HOLD_MS)
-            {
-                arm.state = ARM_STATE_FOLLOWING;
-            }
             else
                 arm.state = ARM_STATE_LOCKED;
         }
@@ -255,6 +287,8 @@ static void Arm_UpdateState(void)
                 }
             }
             arm.q_offset_valid = 0;
+            arm_q_offset_mask = 0;
+            arm_catchup_mask = 0;
         }
         else if(arm.state == ARM_STATE_DISABLED)
         {
@@ -264,6 +298,8 @@ static void Arm_UpdateState(void)
                 if(m) { DM_Motor_Disable(m->hfdcan, m->can_id); osDelay(1); }
             }
             arm.q_offset_valid = 0;
+            arm_q_offset_mask = 0;
+            arm_catchup_mask = 0;
         }
         arm.last_state = arm.state;
     }
@@ -272,55 +308,80 @@ static void Arm_UpdateState(void)
     {
         if(!arm.q_offset_valid && arm.connected && arm.recv_cnt > 0)
         {
-            for(int i = 0; i < ARM_JOINT_NUM; i++)
-            {
-                DM_Motor_t *m = DM_Motor_Get(i);
-                if(m && m->rx_cnt > 0)
-                {
-                    arm.q_offset[i]   = ARM_DIR[i] * arm.target_joint[i] - m->position;
-                    arm.cmd_smooth[i] = m->position;
-                }
-            }
-            arm.q_offset_valid = 1;
+            (void)Arm_CaptureFollowOffset();
         }
     }
     else
     {
         arm.q_offset_valid = 0;
+        arm_q_offset_mask = 0;
+        arm_catchup_mask = 0;
     }
 }
 
-static float Arm_RateLimit(float target, float current)
+static float Arm_RateLimit(float target, float current, float max_step)
 {
     float err = target - current;
-    if(err > ARM_MAX_STEP) return current + ARM_MAX_STEP;
-    if(err < -ARM_MAX_STEP) return current - ARM_MAX_STEP;
+    if(err > max_step) return current + max_step;
+    if(err < -max_step) return current - max_step;
     return target;
 }
 
 void Arm_ControlLoop(void)
 {
     static uint32_t t_heal = 0;
-    if(HAL_GetTick() - t_heal > 200)
+    static uint8_t heal_enable_mask = 0;
+    static uint32_t heal_enable_due[ARM_JOINT_NUM] = {0};
+    uint32_t now = HAL_GetTick();
+
+    /* Keep the 2ms control task non-blocking. Queue enable 2ms after a clear
+       command instead of sleeping inside the control loop. */
+    for(int i = 0; i < ARM_JOINT_NUM; i++)
     {
-        t_heal = HAL_GetTick();
+        uint8_t bit = (uint8_t)(1u << i);
+        if((heal_enable_mask & bit) && (int32_t)(now - heal_enable_due[i]) >= 0)
+        {
+            DM_Motor_t *m = DM_Motor_Get(i);
+            if(m) DM_Motor_Enable(m->hfdcan, m->can_id);
+            heal_enable_mask &= (uint8_t)~bit;
+        }
+    }
+
+    if((uint32_t)(now - t_heal) >= 200u)
+    {
+        t_heal = now;
         if(arm.state == ARM_STATE_LOCKED || arm.state == ARM_STATE_FOLLOWING)
         {
             for(int i = 0; i < ARM_JOINT_NUM; i++)
             {
+                uint8_t bit = (uint8_t)(1u << i);
                 DM_Motor_t *m = DM_Motor_Get(i);
-                if(m && m->error != 1)
+                if(m && !(heal_enable_mask & bit) &&
+                   (m->rx_cnt == 0 || m->error != 0))
                 {
                     DM_Motor_ClearError(m->hfdcan, m->can_id);
-                    osDelay(1);
-                    DM_Motor_Enable(m->hfdcan, m->can_id);
-                    osDelay(1);
+                    heal_enable_due[i] = now + 2u;
+                    heal_enable_mask |= bit;
                 }
             }
         }
     }
 
     Arm_UpdateState();
+
+    /* After a long outage, treat the newly received master pose as the new
+       clutch point. Shorter gaps keep following, with reduced slew instead. */
+    if(arm_reclutch_req)
+    {
+        arm_reclutch_req = 0;
+        if(arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active)
+        {
+            arm.q_offset_valid = 0;
+            arm_q_offset_mask = 0;
+            arm_catchup_mask = 0;
+            if(Arm_CaptureFollowOffset()) zb_reclutch_cnt++;
+        }
+    }
 
     if(arm.state == ARM_STATE_DISABLED) return;
 
@@ -329,7 +390,21 @@ void Arm_ControlLoop(void)
         DM_Motor_t *m = DM_Motor_Get(i);
         if(m == NULL || m->hfdcan == NULL) continue;
 
-        if(arm.state == ARM_STATE_FOLLOWING && arm.q_offset_valid && m->rx_cnt > 0)
+        uint8_t joint_bit = (uint8_t)(1u << i);
+        if(arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active && m->rx_cnt > 0 &&
+           !(arm_q_offset_mask & joint_bit))
+        {
+            /* Capture each joint independently; one late motor must not leave
+               the remaining joints running with an implicit zero offset. */
+            arm.q_offset[i]   = ARM_DIR[i] * arm.target_joint[i] - m->position;
+            arm.cmd_smooth[i] = m->position;
+            arm_q_offset_mask |= joint_bit;
+            arm.q_offset_valid =
+                (arm_q_offset_mask == ((1u << ARM_JOINT_NUM) - 1u));
+        }
+
+        if(arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active &&
+           (arm_q_offset_mask & joint_bit) && m->rx_cnt > 0)
         {
             if(arm.connected)
             {
@@ -341,18 +416,30 @@ void Arm_ControlLoop(void)
                     arm.q_offset[i] += (raw_target - clamped);
                 }
 #endif
-                arm.cmd_smooth[i] = Arm_RateLimit(clamped, arm.cmd_smooth[i]);
+                float max_step = ARM_MAX_STEP;
+                float target_error = clamped - arm.cmd_smooth[i];
+                if((arm_catchup_mask & joint_bit) && fabsf(target_error) <= 0.05f)
+                {
+                    arm_catchup_mask &= (uint8_t)~joint_bit;
+                }
+                if(arm_catchup_mask & joint_bit)
+                    max_step = ARM_CATCHUP_SPEED_RAD_S * ARM_CTRL_PERIOD_S;
+                arm.cmd_smooth[i] = Arm_RateLimit(clamped, arm.cmd_smooth[i], max_step);
             }
         }
-        else
+        else if(arm.state != ARM_STATE_FOLLOWING)
         {
+            /* While following, a temporary link/enable loss must hold the
+               last commanded pose; arm_lock_pos can be an older clutch pose. */
             arm.cmd_smooth[i] = arm_lock_pos[i];
         }
 
+        /* PVT 的第二个参数是速度控制量，不是"限幅"。写成 0.0f 等于一直命令
+           电机"目标速度 0 rad/s"，位置目标再怎么变它都会原地顶住——这正是
+           绿灯但完全不动的原因。恢复成 JOINT_MAX_VEL 让它跟着位置走。 */
         DM_Motor_PVT_Control(m->hfdcan, m->can_id,
                              arm.cmd_smooth[i], JOINT_MAX_VEL, ARM_CUR_LIMIT[i]);
 
-        osDelay(1);
     }
 }
 

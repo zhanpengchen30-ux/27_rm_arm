@@ -51,6 +51,28 @@ volatile uint32_t zb_restart    = 0;
 volatile uint32_t zb_gap_max_ms = 0;
 volatile uint32_t zb_reclutch_cnt = 0;
 
+/* ---- 帧格式（与主手 Apps/zigbee.c 严格一致）----------------------------
+   17 字节：AA | q0..q5 (12B) | active | seq | crc8 | 55
+   crc8 = CRC-8/ATM(poly 0x07)，覆盖 buf[0..14]
+   seq 每帧 +1，用于统计无线丢帧（zb_seq_lost）                          */
+#define ZIGBEE_FRAME_LEN   17u
+volatile uint32_t zb_crc_err  = 0;   /* CRC 校验失败次数 */
+volatile uint32_t zb_seq_lost = 0;   /* 按序号推算出的丢帧数 */
+static uint8_t zigbee_last_seq   = 0;
+static uint8_t zigbee_seq_valid  = 0;
+
+static uint8_t Zigbee_Crc8(const uint8_t *d, uint8_t n)
+{
+    uint8_t crc = 0x00u;
+    for(uint8_t i = 0; i < n; i++)
+    {
+        crc ^= d[i];
+        for(uint8_t b = 0; b < 8u; b++)
+            crc = (crc & 0x80u) ? (uint8_t)((crc << 1) ^ 0x07u) : (uint8_t)(crc << 1);
+    }
+    return crc;
+}
+
 /* Jump filter: a single frame whose target moves more than ARM_JUMP_MAX_RAD is
    treated as a link glitch / master re-zero. It is only accepted once the next
    frame confirms it, so the slave never lunges at full speed after a dropout. */
@@ -100,7 +122,7 @@ static float Arm_ClampJoint(int i, float v)
     return v;
 }
 
-static void Arm_DecodeFrame(uint8_t active)
+static void Arm_DecodeFrame(uint8_t active, uint8_t seq)
 {
     uint32_t now = HAL_GetTick();
     uint8_t long_gap = 0;
@@ -151,6 +173,16 @@ static void Arm_DecodeFrame(uint8_t active)
     }
     arm.active = active;
     arm.connected = 1;
+
+    /* 用序号统计真实丢帧：正常应为 +1 */
+    if(zigbee_seq_valid)
+    {
+        uint8_t adv = (uint8_t)(seq - zigbee_last_seq);
+        if(adv > 1u) zb_seq_lost += (uint32_t)(adv - 1u);
+    }
+    zigbee_last_seq  = seq;
+    zigbee_seq_valid = 1;
+
     arm.recv_cnt++;
     arm.last_rx_tick = now;
 }
@@ -178,21 +210,24 @@ void Arm_Zigbee_ParseByte(uint8_t byte)
     }
     zigbee_buf[zigbee_idx++] = byte;
 
-    if(zigbee_idx == 15)
+    if(zigbee_idx == ZIGBEE_FRAME_LEN)
     {
-        if(zigbee_buf[14] == 0x55)
+        uint8_t crc_calc = Zigbee_Crc8(zigbee_buf, (uint8_t)(ZIGBEE_FRAME_LEN - 2u)); /* [0..14] */
+        if(zigbee_buf[ZIGBEE_FRAME_LEN - 1u] == 0x55 &&
+           crc_calc == zigbee_buf[ZIGBEE_FRAME_LEN - 2u])
         {
-            Arm_DecodeFrame(zigbee_buf[13]);
+            Arm_DecodeFrame(zigbee_buf[13], zigbee_buf[14]);
             zigbee_idx = 0;
         }
         else
         {
-            zb_bad_tail++;
+            if(zigbee_buf[ZIGBEE_FRAME_LEN - 1u] != 0x55) zb_bad_tail++;
+            else                                          zb_crc_err++;
             Arm_ZigbeeResync();
         }
         return;
     }
-    if(zigbee_idx >= 16) zigbee_idx = 0;
+    if(zigbee_idx >= ZIGBEE_FRAME_LEN + 1u) zigbee_idx = 0;
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)

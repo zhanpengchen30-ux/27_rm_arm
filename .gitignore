@@ -34,3 +34,6 @@ JLinkSettings.ini
 # ===== 其他 =====
 .DS_Store
 Thumbs.db
+
+# ===== AI 助手的本地工作记录（不入库）=====
+.workbuddy/

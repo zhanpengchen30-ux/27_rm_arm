@@ -83,7 +83,7 @@ static void Arm_InterpResetAll(void)
 }
 
 static const float ARM_DIR[ARM_JOINT_NUM] = {
-    1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f
+    1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f
 };
 
 static const float ARM_Q_MIN[ARM_JOINT_NUM] = { -3.10f, -2.80f, -0.65f, -10.0f, -10.0f, -10.0f};

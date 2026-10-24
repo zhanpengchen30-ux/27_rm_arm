@@ -24,13 +24,12 @@ static uint8_t zigbee_idx = 0;
 #define ARM_GAP_RECLUTCH_MS 500u
 #define ARM_CATCHUP_SPEED_RAD_S 1.5f
 
-/* PVT velocity field (u16) is the velocity fed to the motor's inner loop.
-   A constant 4 rad/s tells every joint "keep moving at 4 rad/s" even when the
-   position target is standing still - the position loop then fights it and the
-   joint rings (visible as vibration at standstill, independent of the link).
-   Feed the actually commanded speed instead: 0 when holding, N rad/s when
-   moving. */
+/* PVT velocity field (u16) is the speed the inner loop may use to reach the
+   position target. Feeding 0 at standstill removes its ability to correct a
+   gravity sag (J2 slowly drops), feeding a constant 4 makes it ring.
+   Use the commanded speed with a floor that still allows holding. */
 #define ARM_VEL_MAX_RAD_S   4.0f
+#define ARM_VEL_MIN_RAD_S   1.5f
 static float arm_prev_cmd[ARM_JOINT_NUM] = {0};
 static volatile uint8_t arm_catchup_mask = 0;
 static volatile uint8_t arm_reclutch_req = 0;
@@ -81,7 +80,7 @@ static const float ARM_Q_MIN[ARM_JOINT_NUM] = { -3.10f, -2.80f, -0.65f, -10.0f, 
 static const float ARM_Q_MAX[ARM_JOINT_NUM] = {  0.05f,  0.05f,  1.90f,  10.0f,  10.0f,  10.0f};
 
 static const float ARM_CUR_LIMIT[ARM_JOINT_NUM] = {
-    0.7f,  0.7f,  0.7f,  0.7f,  0.7f,  0.7f
+    0.7f,  1.2f,  0.7f,  0.7f,  0.7f,  0.7f
 };
 
 static float Arm_ClampJoint(int i, float v)
@@ -485,9 +484,10 @@ void Arm_ControlLoop(void)
             arm.cmd_smooth[i] = arm_lock_pos[i];
         }
 
-        /* feed the real commanded speed (0 while holding) into the PVT velocity field */
+        /* commanded speed with a floor so the inner loop can still hold the pose */
         float vmag = fabsf(arm.cmd_smooth[i] - arm_prev_cmd[i]) / ARM_CTRL_PERIOD_S;
         arm_prev_cmd[i] = arm.cmd_smooth[i];
+        if(vmag < ARM_VEL_MIN_RAD_S) vmag = ARM_VEL_MIN_RAD_S;
         if(vmag > ARM_VEL_MAX_RAD_S) vmag = ARM_VEL_MAX_RAD_S;
 
         DM_Motor_PVT_Control(m->hfdcan, m->can_id,

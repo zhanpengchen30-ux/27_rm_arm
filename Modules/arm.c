@@ -31,6 +31,16 @@ static uint8_t zigbee_idx = 0;
 #define ARM_VEL_MAX_RAD_S   4.0f
 #define ARM_VEL_MIN_RAD_S   1.5f
 static float arm_prev_cmd[ARM_JOINT_NUM] = {0};
+
+/* Jitter diagnostics: per-joint peak-to-peak over a 1s window, 500Hz sampled.
+   dbg_tgt_pp  > 0  => the command itself is moving (master noise / link)
+   dbg_pos_pp  > 0 while tgt_pp ~ 0 => the motor's own loop is oscillating */
+static float dbg_tgt_min[ARM_JOINT_NUM] = {1e9f,1e9f,1e9f,1e9f,1e9f,1e9f};
+static float dbg_tgt_max[ARM_JOINT_NUM] = {-1e9f,-1e9f,-1e9f,-1e9f,-1e9f,-1e9f};
+static float dbg_pos_min[ARM_JOINT_NUM] = {1e9f,1e9f,1e9f,1e9f,1e9f,1e9f};
+static float dbg_pos_max[ARM_JOINT_NUM] = {-1e9f,-1e9f,-1e9f,-1e9f,-1e9f,-1e9f};
+volatile float dbg_tgt_pp[ARM_JOINT_NUM] = {0};
+volatile float dbg_pos_pp[ARM_JOINT_NUM] = {0};
 static volatile uint8_t arm_catchup_mask = 0;
 static volatile uint8_t arm_reclutch_req = 0;
 static uint8_t arm_q_offset_mask = 0;
@@ -365,6 +375,26 @@ void Arm_ControlLoop(void)
     static uint32_t heal_enable_due[ARM_JOINT_NUM] = {0};
     uint32_t now = HAL_GetTick();
 
+    /* 1s jitter window: publish peak-to-peak, then restart the window */
+    {
+        static uint32_t t_pp = 0;
+        if((uint32_t)(now - t_pp) >= 1000u)
+        {
+            t_pp = now;
+            for(int i = 0; i < ARM_JOINT_NUM; i++)
+            {
+                if(dbg_tgt_min[i] > dbg_tgt_max[i]) { dbg_tgt_pp[i] = 0.0f; dbg_pos_pp[i] = 0.0f; }
+                else
+                {
+                    dbg_tgt_pp[i] = dbg_tgt_max[i] - dbg_tgt_min[i];
+                    dbg_pos_pp[i] = dbg_pos_max[i] - dbg_pos_min[i];
+                }
+                dbg_tgt_min[i] =  1e9f; dbg_tgt_max[i] = -1e9f;
+                dbg_pos_min[i] =  1e9f; dbg_pos_max[i] = -1e9f;
+            }
+        }
+    }
+
     /* Keep the 2ms control task non-blocking. Queue enable 2ms after a clear
        command instead of sleeping inside the control loop. */
     for(int i = 0; i < ARM_JOINT_NUM; i++)
@@ -489,6 +519,12 @@ void Arm_ControlLoop(void)
         arm_prev_cmd[i] = arm.cmd_smooth[i];
         if(vmag < ARM_VEL_MIN_RAD_S) vmag = ARM_VEL_MIN_RAD_S;
         if(vmag > ARM_VEL_MAX_RAD_S) vmag = ARM_VEL_MAX_RAD_S;
+
+        /* jitter tracking (500Hz) */
+        if(arm.target_joint[i] < dbg_tgt_min[i]) dbg_tgt_min[i] = arm.target_joint[i];
+        if(arm.target_joint[i] > dbg_tgt_max[i]) dbg_tgt_max[i] = arm.target_joint[i];
+        if(m->position < dbg_pos_min[i]) dbg_pos_min[i] = m->position;
+        if(m->position > dbg_pos_max[i]) dbg_pos_max[i] = m->position;
 
         DM_Motor_PVT_Control(m->hfdcan, m->can_id,
                              arm.cmd_smooth[i], vmag, ARM_CUR_LIMIT[i]);

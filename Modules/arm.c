@@ -23,6 +23,15 @@ static uint8_t zigbee_idx = 0;
 #define ARM_GAP_CATCHUP_MS  100u
 #define ARM_GAP_RECLUTCH_MS 500u
 #define ARM_CATCHUP_SPEED_RAD_S 1.5f
+
+/* PVT velocity field (u16) is the velocity fed to the motor's inner loop.
+   A constant 4 rad/s tells every joint "keep moving at 4 rad/s" even when the
+   position target is standing still - the position loop then fights it and the
+   joint rings (visible as vibration at standstill, independent of the link).
+   Feed the actually commanded speed instead: 0 when holding, N rad/s when
+   moving. */
+#define ARM_VEL_MAX_RAD_S   4.0f
+static float arm_prev_cmd[ARM_JOINT_NUM] = {0};
 static volatile uint8_t arm_catchup_mask = 0;
 static volatile uint8_t arm_reclutch_req = 0;
 static uint8_t arm_q_offset_mask = 0;
@@ -438,6 +447,7 @@ void Arm_ControlLoop(void)
                the remaining joints running with an implicit zero offset. */
             arm.q_offset[i]   = ARM_DIR[i] * arm.target_joint[i] - m->position;
             arm.cmd_smooth[i] = m->position;
+            arm_prev_cmd[i]   = m->position;   /* no velocity kick at clutch */
             Arm_InterpResetJoint(i);
             arm_q_offset_mask |= joint_bit;
             arm.q_offset_valid =
@@ -475,11 +485,13 @@ void Arm_ControlLoop(void)
             arm.cmd_smooth[i] = arm_lock_pos[i];
         }
 
-        /* PVT 的第二个参数是速度控制量，不是"限幅"。写成 0.0f 等于一直命令
-           电机"目标速度 0 rad/s"，位置目标再怎么变它都会原地顶住——这正是
-           绿灯但完全不动的原因。恢复成 JOINT_MAX_VEL 让它跟着位置走。 */
+        /* feed the real commanded speed (0 while holding) into the PVT velocity field */
+        float vmag = fabsf(arm.cmd_smooth[i] - arm_prev_cmd[i]) / ARM_CTRL_PERIOD_S;
+        arm_prev_cmd[i] = arm.cmd_smooth[i];
+        if(vmag > ARM_VEL_MAX_RAD_S) vmag = ARM_VEL_MAX_RAD_S;
+
         DM_Motor_PVT_Control(m->hfdcan, m->can_id,
-                             arm.cmd_smooth[i], JOINT_MAX_VEL, ARM_CUR_LIMIT[i]);
+                             arm.cmd_smooth[i], vmag, ARM_CUR_LIMIT[i]);
 
     }
 }

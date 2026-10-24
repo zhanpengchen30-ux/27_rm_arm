@@ -41,6 +41,29 @@ static uint8_t  arm_jump_hold[ARM_JOINT_NUM] = {0};
 static float    arm_jump_pend[ARM_JOINT_NUM] = {0};
 volatile uint32_t zb_jump_reject = 0;
 
+/* ---- master frame interpolation ------------------------------------------
+   The master sends every 10ms while the loop runs every 2ms. Applying a whole
+   frame's delta inside one 2ms tick gives a ~5rad/s burst followed by ~8ms of
+   standstill - the arm buzzes at 100Hz. Spread each frame's delta over
+   ARM_INTERP_TICKS ticks so the command becomes a continuous ramp. */
+#define ARM_INTERP_TICKS 5u
+static float    arm_interp_target[ARM_JOINT_NUM] = {0};
+static float    arm_interp_step[ARM_JOINT_NUM]   = {0};
+static uint32_t arm_interp_left = 0;
+static uint32_t arm_last_frame_cnt = 0;
+
+static void Arm_InterpResetJoint(int i)
+{
+    arm_interp_target[i] = arm.target_joint[i];
+    arm_interp_step[i]   = 0.0f;
+}
+
+static void Arm_InterpResetAll(void)
+{
+    for(int i = 0; i < ARM_JOINT_NUM; i++) Arm_InterpResetJoint(i);
+    arm_interp_left = 0;
+}
+
 static const float ARM_DIR[ARM_JOINT_NUM] = {
     1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f
 };
@@ -379,11 +402,28 @@ void Arm_ControlLoop(void)
             arm.q_offset_valid = 0;
             arm_q_offset_mask = 0;
             arm_catchup_mask = 0;
+            Arm_InterpResetAll();
             if(Arm_CaptureFollowOffset()) zb_reclutch_cnt++;
         }
     }
 
     if(arm.state == ARM_STATE_DISABLED) return;
+
+    /* spread each new master frame over ARM_INTERP_TICKS control ticks */
+    if(arm.recv_cnt != arm_last_frame_cnt)
+    {
+        arm_last_frame_cnt = arm.recv_cnt;
+        for(int i = 0; i < ARM_JOINT_NUM; i++)
+        {
+            arm_interp_step[i] = (arm.target_joint[i] - arm_interp_target[i]) / (float)ARM_INTERP_TICKS;
+        }
+        arm_interp_left = ARM_INTERP_TICKS;
+    }
+    if(arm_interp_left > 0)
+    {
+        for(int i = 0; i < ARM_JOINT_NUM; i++) arm_interp_target[i] += arm_interp_step[i];
+        arm_interp_left--;
+    }
 
     for(int i = 0; i < ARM_JOINT_NUM; i++)
     {
@@ -398,6 +438,7 @@ void Arm_ControlLoop(void)
                the remaining joints running with an implicit zero offset. */
             arm.q_offset[i]   = ARM_DIR[i] * arm.target_joint[i] - m->position;
             arm.cmd_smooth[i] = m->position;
+            Arm_InterpResetJoint(i);
             arm_q_offset_mask |= joint_bit;
             arm.q_offset_valid =
                 (arm_q_offset_mask == ((1u << ARM_JOINT_NUM) - 1u));
@@ -408,7 +449,7 @@ void Arm_ControlLoop(void)
         {
             if(arm.connected)
             {
-                float raw_target = ARM_DIR[i] * arm.target_joint[i] - arm.q_offset[i];
+                float raw_target = ARM_DIR[i] * arm_interp_target[i] - arm.q_offset[i];
                 float clamped    = Arm_ClampJoint(i, raw_target);
 #if ARM_LIMIT_DRAG
                 if(clamped != raw_target)

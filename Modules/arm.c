@@ -29,7 +29,7 @@ static uint8_t zigbee_idx = 0;
    gravity sag (J2 slowly drops), feeding a constant 4 makes it ring.
    Use the commanded speed with a floor that still allows holding. */
 #define ARM_VEL_MAX_RAD_S   4.0f
-#define ARM_VEL_MIN_RAD_S   1.5f
+#define ARM_VEL_MIN_RAD_S   0.4f
 static float arm_prev_cmd[ARM_JOINT_NUM] = {0};
 
 /* Jitter diagnostics: per-joint peak-to-peak over a 1s window, 500Hz sampled.

@@ -19,7 +19,8 @@ static uint8_t zigbee_idx = 0;
 #endif
 #define ZIGBEE_TIMEOUT_MS   ARM_RX_TIMEOUT_MS
 
-#define ARM_LIMIT_DRAG      1
+/* 越限策略：已改为"纯限位"（不再吃偏移），保留定义仅作历史说明 */
+/* #define ARM_LIMIT_DRAG   1 */
 #define ARM_GAP_CATCHUP_MS  100u
 #define ARM_GAP_RECLUTCH_MS 500u
 #define ARM_CATCHUP_SPEED_RAD_S 1.5f
@@ -44,6 +45,12 @@ volatile float dbg_pos_pp[ARM_JOINT_NUM] = {0};
 static volatile uint8_t arm_catchup_mask = 0;
 static volatile uint8_t arm_reclutch_req = 0;
 static uint8_t arm_q_offset_mask = 0;
+
+/* 越限状态（只读观察用）：
+   mask 某位为 1 = 该关节主手已越过从手限位、从手正停在限位上；
+   excursion = 主手超出限位的角度（rad）。回到 0 即恢复严格同步。 */
+volatile uint8_t arm_limit_mask = 0;
+volatile float   arm_limit_excursion[ARM_JOINT_NUM] = {0};
 
 volatile uint32_t zb_bad_tail   = 0;
 volatile uint32_t zb_resync     = 0;
@@ -525,12 +532,21 @@ void Arm_ControlLoop(void)
             {
                 float raw_target = ARM_DIR[i] * arm_interp_target[i] - arm.q_offset[i];
                 float clamped    = Arm_ClampJoint(i, raw_target);
-#if ARM_LIMIT_DRAG
+
+                /* 越限：从手停在限位，q_offset 一律不改。
+                   旧逻辑把超出量累加进 q_offset（"吃偏移"），主手一过限再回来，
+                   主从对应关系就永久变了 —— 这正是"反方向角度就改变"的原因。
+                   现在只记录越限量，主手退回到限位内立刻恢复严格同步。 */
                 if(clamped != raw_target)
                 {
-                    arm.q_offset[i] += (raw_target - clamped);
+                    arm_limit_mask |= (uint8_t)(1u << i);
+                    arm_limit_excursion[i] = raw_target - clamped;
                 }
-#endif
+                else
+                {
+                    arm_limit_mask &= (uint8_t)~(1u << i);
+                    arm_limit_excursion[i] = 0.0f;
+                }
                 float max_step = ARM_MAX_STEP;
                 float target_error = clamped - arm.cmd_smooth[i];
                 if((arm_catchup_mask & joint_bit) && fabsf(target_error) <= 0.05f)

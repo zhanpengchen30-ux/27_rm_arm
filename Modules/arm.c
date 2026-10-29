@@ -62,7 +62,7 @@ volatile uint32_t zb_reclutch_cnt = 0;
    17 字节：AA | q0..q5 (12B) | active | seq | crc8 | 55
    crc8 = CRC-8/ATM(poly 0x07)，覆盖 buf[0..14]
    seq 每帧 +1，用于统计无线丢帧（zb_seq_lost）                          */
-#define ZIGBEE_FRAME_LEN   17u
+#define ZIGBEE_FRAME_LEN   18u
 volatile uint32_t zb_crc_err  = 0;   /* CRC 校验失败次数 */
 volatile uint32_t zb_seq_lost = 0;   /* 按序号推算出的丢帧数 */
 static uint8_t zigbee_last_seq   = 0;
@@ -129,11 +129,14 @@ static float Arm_ClampJoint(int i, float v)
     return v;
 }
 
-static void Arm_DecodeFrame(uint8_t active, uint8_t seq)
+static void Arm_DecodeFrame(uint8_t active, uint8_t grip, uint8_t seq)
 {
     uint32_t now = HAL_GetTick();
     uint8_t long_gap = 0;
     uint8_t reacquire = (active && !arm.active);
+
+    /* 主手夹爪按键：0=开 1=合。先只记录，驱动逻辑见下方 ARM_USE_GRIPPER。 */
+    arm.gripper_cmd_recv = grip;
     if(arm.recv_cnt > 0)
     {
         uint32_t gap = now - arm.last_rx_tick;
@@ -223,7 +226,7 @@ void Arm_Zigbee_ParseByte(uint8_t byte)
         if(zigbee_buf[ZIGBEE_FRAME_LEN - 1u] == 0x55 &&
            crc_calc == zigbee_buf[ZIGBEE_FRAME_LEN - 2u])
         {
-            Arm_DecodeFrame(zigbee_buf[13], zigbee_buf[14]);
+            Arm_DecodeFrame(zigbee_buf[13], zigbee_buf[14], zigbee_buf[15]);
             zigbee_idx = 0;
         }
         else

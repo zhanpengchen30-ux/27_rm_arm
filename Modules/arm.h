@@ -10,12 +10,16 @@
 // 注意：主手侧的开关还没进通信协议，夹爪状态目前传不过来
 #define ARM_USE_GRIPPER 0
 
-// Zigbee接收帧格式 (15字节)
-// 0xAA + 6*int16(0.001rad) + active(1B) + 0x55
+// Zigbee接收帧格式 (18字节)
+// 0xAA + 6*int16(0.001rad) + active + grip + seq + crc8 + 0x55
+// 2026-10-29: 主手加夹爪按键，帧从 17 变 18，grip 插在 active 后面。
+// ⚠ 主手 27_custroller/Apps/zigbee.c 的 Zigbee_SendJoints 必须与此一致。
 #define ZIGBEE_HEAD          0xAA
 #define ZIGBEE_TAIL          0x55
-#define ZIGBEE_ACTIVE_OFFSET 13   
-#define ZIGBEE_FRAME_LEN     15   
+#define ZIGBEE_ACTIVE_OFFSET 13
+#define ZIGBEE_GRIP_OFFSET   14
+#define ZIGBEE_SEQ_OFFSET    15
+#define ZIGBEE_FRAME_LEN     18
 
 #define ARM_RX_TIMEOUT_MS    500
 

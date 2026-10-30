@@ -191,6 +191,28 @@ static uint32_t Arm_MotorIdBase(int i)
     return 0x300u;
 }
 
+/* 发一条命令帧到第 i 台电机。
+ *
+ * 前 6 个关节一直用 0x300+id，工作正常。
+ * 第 7 台（夹爪）的控制模式未知 —— 串口 dump 显示 Control Mode: 4，
+ * 而不同模式认的 ID 段不一样（0x300=PVT/混合、0x000=MIT、0x100=位置速度）。
+ * 与其继续猜，使能/清错这类命令帧对夹爪同时发两个基址：多发一帧的代价，
+ * 换来"不用先弄清模式也能使能"。哪个生效就以哪个为准（看 rx_cnt 涨不涨）。
+ * 控制帧仍走 g_grip_id_base，等确认模式后再定。 */
+static void Arm_SendCmd(DM_Motor_t *m, int i, uint32_t cmd)
+{
+#if ARM_USE_GRIPPER
+    if(i == ARM_JOINT_NUM)
+    {
+        DM_Motor_CmdAt(m->hfdcan, g_grip_id_base, m->can_id, cmd);
+        if(g_grip_id_base != 0x300u) DM_Motor_CmdAt(m->hfdcan, 0x300u, m->can_id, cmd);
+        if(g_grip_id_base != 0x000u) DM_Motor_CmdAt(m->hfdcan, 0x000u, m->can_id, cmd);
+        return;
+    }
+#endif
+    DM_Motor_CmdAt(m->hfdcan, Arm_MotorIdBase(i), m->can_id, cmd);
+}
+
 static void Arm_DecodeFrame(uint8_t active, uint8_t grip, uint8_t seq)
 {
     uint32_t now = HAL_GetTick();
@@ -405,14 +427,14 @@ static void Arm_UpdateState(void)
             for(int i = 0; i < ARM_MOTOR_NUM; i++)
             {
                 DM_Motor_t *m = DM_Motor_Get(i);
-                if(m) { DM_Motor_CmdAt(m->hfdcan, Arm_MotorIdBase(i), m->can_id, DM_CMD_CLEAR_ERR); osDelay(1); }
+                if(m) { Arm_SendCmd(m, i, DM_CMD_CLEAR_ERR); osDelay(1); }
             }
             osDelay(2);
             for(int i = 0; i < ARM_MOTOR_NUM; i++)
             {
                 DM_Motor_t *m = DM_Motor_Get(i);
                 if(m) {
-                    DM_Motor_CmdAt(m->hfdcan, Arm_MotorIdBase(i), m->can_id, DM_CMD_ENABLE);
+                    Arm_SendCmd(m, i, DM_CMD_ENABLE);
                     if(i < ARM_JOINT_NUM && m->rx_cnt > 0)
                     {
                         arm_lock_pos[i]   = m->position;

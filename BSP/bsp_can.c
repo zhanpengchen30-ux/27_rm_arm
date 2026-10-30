@@ -3,6 +3,40 @@
 #include "string.h"
 #include "math.h"
 
+/* 诊断：FDCAN1 上按原始 ID 统计收到的帧数（只统计 ID < 32）。
+   某个电机 can_rx_id_raw[0x1x] 不涨 = 它根本没在总线上应答。 */
+volatile uint32_t can_rx_id_raw[32] = {0};
+/* 解码队列满导致的丢帧。一直涨说明 Can_Decode_Task 跟不上总线流量。 */
+volatile uint32_t can_rx_drop = 0;
+/* 分总线统计，给扫描用：下标 1/2/3 对应 FDCAN1/2/3 */
+volatile uint32_t can_rx_bus_cnt[4] = {0};
+volatile uint32_t can_rx_last_id[4] = {0};
+
+/* 按需启停 FDCAN2/3。平时它们是停的（悬空的收发器会收到噪声，当初
+   就是因此在共用的 RX 回调里统计到幽灵帧），只在扫描电机时临时打开。 */
+static FDCAN_HandleTypeDef* BSP_FDCAN_Aux(uint8_t bus)
+{
+    if(bus == 2u) return &hfdcan2;
+    if(bus == 3u) return &hfdcan3;
+    return NULL;
+}
+
+void BSP_FDCAN_StartAux(uint8_t bus)
+{
+    FDCAN_HandleTypeDef *h = BSP_FDCAN_Aux(bus);
+    if(h == NULL) return;
+    HAL_FDCAN_Start(h);
+    HAL_FDCAN_ActivateNotification(h, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
+}
+
+void BSP_FDCAN_StopAux(uint8_t bus)
+{
+    FDCAN_HandleTypeDef *h = BSP_FDCAN_Aux(bus);
+    if(h == NULL) return;
+    HAL_FDCAN_DeactivateNotification(h, FDCAN_IT_RX_FIFO0_NEW_MESSAGE);
+    HAL_FDCAN_Stop(h);
+}
+
 
 // FDCAN config
 void BSP_FDCAN_Config(void)
@@ -85,8 +119,23 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
                 can_msg.hfdcan = hfdcan;
                 can_msg.can_id = rx_header.Identifier;
                 memcpy(can_msg.data, rx_data, 8);
-                
-                osMessageQueuePut(canRxQueueHandle, &can_msg, 0, 0);
+
+                /* 按原始 ID 统计，用来判断某个电机到底有没有回帧、
+                   以及回帧用的 Master ID 是不是设对了。
+                   达妙电机的 Master ID 应为 0x11~0x17（对应 CAN ID 1~7）。 */
+                if(hfdcan->Instance == FDCAN1 && rx_header.Identifier < 32u)
+                    can_rx_id_raw[rx_header.Identifier]++;
+
+                {
+                    uint8_t bus = (hfdcan->Instance == FDCAN1) ? 1u
+                                : (hfdcan->Instance == FDCAN2) ? 2u
+                                : (hfdcan->Instance == FDCAN3) ? 3u : 0u;
+                    can_rx_bus_cnt[bus]++;
+                    can_rx_last_id[bus] = rx_header.Identifier;
+                }
+
+                if(osMessageQueuePut(canRxQueueHandle, &can_msg, 0, 0) != osOK)
+                    can_rx_drop++;
             }
         }
     }

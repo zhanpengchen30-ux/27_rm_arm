@@ -5,6 +5,7 @@
 #include "usart.h"
 #include "bsp_dr16.h"
 #include "dm_motor.h"
+#include "bsp_can.h"
 #include "cmsis_os2.h"
 
 static uint8_t zigbee_rx_byte;
@@ -18,6 +19,15 @@ static uint8_t zigbee_idx = 0;
 #define ARM_RX_TIMEOUT_MS   500
 #endif
 #define ZIGBEE_TIMEOUT_MS   ARM_RX_TIMEOUT_MS
+
+/* 使能/清错/自愈巡检覆盖的电机数。夹爪打开时含第 7 个（索引 ARM_JOINT_NUM）。
+   注意区分：ARM_JOINT_NUM 只用于"有主从映射关系"的 6 个关节（限位、离合
+   偏移、插值），夹爪不参与那套逻辑，只共用使能与自愈。 */
+#if ARM_USE_GRIPPER
+#define ARM_MOTOR_NUM   DM_MOTOR_NUM
+#else
+#define ARM_MOTOR_NUM   ARM_JOINT_NUM
+#endif
 
 /* 越限策略：已改为"纯限位"（不再吃偏移），保留定义仅作历史说明 */
 /* #define ARM_LIMIT_DRAG   1 */
@@ -59,10 +69,10 @@ volatile uint32_t zb_gap_max_ms = 0;
 volatile uint32_t zb_reclutch_cnt = 0;
 
 /* ---- 帧格式（与主手 Apps/zigbee.c 严格一致）----------------------------
-   17 字节：AA | q0..q5 (12B) | active | seq | crc8 | 55
-   crc8 = CRC-8/ATM(poly 0x07)，覆盖 buf[0..14]
-   seq 每帧 +1，用于统计无线丢帧（zb_seq_lost）                          */
-#define ZIGBEE_FRAME_LEN   18u
+   18 字节：AA | q0..q5 (12B) | active | grip | seq | crc8 | 55
+   crc8 = CRC-8/ATM(poly 0x07)，覆盖 buf[0..15]
+   seq 每帧 +1，用于统计无线丢帧（zb_seq_lost）
+   长度与各字段下标只在 arm.h 里定义一份，别在这里再写一遍。        */
 volatile uint32_t zb_crc_err  = 0;   /* CRC 校验失败次数 */
 volatile uint32_t zb_seq_lost = 0;   /* 按序号推算出的丢帧数 */
 static uint8_t zigbee_last_seq   = 0;
@@ -118,6 +128,9 @@ static const float ARM_DIR[ARM_JOINT_NUM] = {
 static const float ARM_Q_MIN[ARM_JOINT_NUM] = { -3.10f, -2.80f,  -2.40f, -10.0f, -10.0f, -10.0f};
 static const float ARM_Q_MAX[ARM_JOINT_NUM] = {  0.05f,  0.05f,  0.23f,  10.0f,  10.0f,  10.0f};
 
+/* 电流限值。注意单位：PVT 帧里这一项是**额定电流的标幺值**（DM_Motor_PVT_Control
+   内部 ×10000 后装进 u16，协议有效范围 0~10000），不是安培。
+   0.7 = 各自额定电流的 70%，不是 0.7A。 */
 static const float ARM_CUR_LIMIT[ARM_JOINT_NUM] = {
     0.7f,  0.7f,  0.7f,  0.7f,  0.7f,  0.7f
 };
@@ -132,14 +145,51 @@ static float Arm_ClampJoint(int i, float v)
 /* 夹爪开/合目标位置（rad）。
    2026-10-30 串口 dump 读到电机当前位置 Output Position = 1.7238，
    所以默认值放在它附近，避免第一次下发时从 0 猛甩过去。
-   方向未知：先小步试，看夹爪往哪边走，反了就把两个值对调。 */
+   方向未知：先小步试，看夹爪往哪边走，反了就把两个值对调。
+   两个值定义的区间同时也是目标的软限位，Watch 里填错也只会停在区间边界。 */
 volatile float g_grip_open  = 1.72f;
 volatile float g_grip_close = 2.10f;
-volatile float g_grip_step  = 0.002f;   /* 2ms 一拍，0.002 rad ≈ 1 rad/s */
 
-/* 夹爪电流限值（A）。关节用的是 0.7A，夹爪需要更大才能夹住东西；
-   2.0A 对 4310 是安全的连续值。夹不紧就往上加，别超过 4A。 */
-#define GRIP_CUR_LIMIT   2.0f
+/* 夹爪专用的下发周期。开合是二值动作，不需要跟关节一样 500Hz ——
+   第 7 台电机进 2ms 环会把 CAN1 负载从约 72% 推到约 84%（达妙一发一收，
+   回帧省不掉）。10ms 一帧把负载压回约 74%。 */
+#define GRIP_TX_PERIOD_MS   10u
+#define GRIP_TX_PERIOD_S    0.010f
+
+/* 每个下发周期的最大步进(rad)。0.01 rad / 10ms = 1 rad/s。 */
+volatile float g_grip_step  = 0.01f;
+
+/* 夹爪电流限值，单位同 ARM_CUR_LIMIT —— **额定电流的标幺值**，不是安培。
+   4310 额定 2.5A，所以 0.9 ≈ 2.25A，1.0 就已经是满额定。
+   协议上限是 1.0（内部 ×10000 后不能超 10000），夹不紧往上调但别超 1.0。 */
+volatile float g_grip_cur = 0.9f;
+
+/* 目标相对实测位置的最大超前量(rad)。夹住东西后目标走不动，误差会一路顶到
+   电流限幅并长时间堵转（4310 升温很快）。把误差钳住就等于把夹持力钳住：
+   既保住夹持力，又不会满电流死顶。顺带兜住 Watch 里把 g_grip_close 填成
+   离谱数值的情况 —— 目标永远跑不出实测位置 ±这个值。 */
+#define GRIP_MAX_LAG        0.15f
+
+/* 第一次拿到夹爪反馈时把目标对齐到实际位置，否则 target_gripper 从 0 起算，
+   上电后第一帧就会命令它猛甩一大段。失能时清零，下次使能重新对齐。 */
+static uint8_t arm_grip_synced = 0;
+
+/* 夹爪命令帧的控制模式基址。6 个关节已确认是"位置力矩混合"(0x300)，
+   夹爪是后装的电机，它的 CTRL_MODE 参数未必改过 —— 基址和电机实际模式
+   不一致时，电机会完全忽略整帧（不回帧、不使能），表现就是怎么发都不动。
+   在 Keil Watch 里改这个值可以不重新编译就试出它真正的模式：
+     0x000 = MIT   0x100 = 位置速度   0x200 = 速度   0x300 = 位置力矩混合
+   注意：PVT 控制帧固定走 0x300，所以试出来不是 0x300 的话，
+   正确做法是用达妙上位机把 CTRL_MODE 改成混合模式，而不是留在这里。 */
+volatile uint32_t g_grip_id_base = 0x300u;
+
+static uint32_t Arm_MotorIdBase(int i)
+{
+#if ARM_USE_GRIPPER
+    if(i == ARM_JOINT_NUM) return g_grip_id_base;
+#endif
+    return 0x300u;
+}
 
 static void Arm_DecodeFrame(uint8_t active, uint8_t grip, uint8_t seq)
 {
@@ -237,7 +287,9 @@ void Arm_Zigbee_ParseByte(uint8_t byte)
         if(zigbee_buf[ZIGBEE_FRAME_LEN - 1u] == 0x55 &&
            crc_calc == zigbee_buf[ZIGBEE_FRAME_LEN - 2u])
         {
-            Arm_DecodeFrame(zigbee_buf[13], zigbee_buf[14], zigbee_buf[15]);
+            Arm_DecodeFrame(zigbee_buf[ZIGBEE_ACTIVE_OFFSET],
+                            zigbee_buf[ZIGBEE_GRIP_OFFSET],
+                            zigbee_buf[ZIGBEE_SEQ_OFFSET]);
             zigbee_idx = 0;
         }
         else
@@ -346,23 +398,21 @@ static void Arm_UpdateState(void)
         arm.active = 0;
     }
 
-    const int motor_num = ARM_USE_GRIPPER ? DM_MOTOR_NUM : ARM_JOINT_NUM;
-
     if(arm.state != arm.last_state)
     {
         if(arm.last_state == ARM_STATE_DISABLED && arm.state != ARM_STATE_DISABLED)
         {
-            for(int i = 0; i < motor_num; i++)
+            for(int i = 0; i < ARM_MOTOR_NUM; i++)
             {
                 DM_Motor_t *m = DM_Motor_Get(i);
-                if(m) { DM_Motor_ClearError(m->hfdcan, m->can_id); osDelay(1); }
+                if(m) { DM_Motor_CmdAt(m->hfdcan, Arm_MotorIdBase(i), m->can_id, DM_CMD_CLEAR_ERR); osDelay(1); }
             }
             osDelay(2);
-            for(int i = 0; i < motor_num; i++)
+            for(int i = 0; i < ARM_MOTOR_NUM; i++)
             {
                 DM_Motor_t *m = DM_Motor_Get(i);
                 if(m) {
-                    DM_Motor_Enable(m->hfdcan, m->can_id);
+                    DM_Motor_CmdAt(m->hfdcan, Arm_MotorIdBase(i), m->can_id, DM_CMD_ENABLE);
                     if(i < ARM_JOINT_NUM && m->rx_cnt > 0)
                     {
                         arm_lock_pos[i]   = m->position;
@@ -389,14 +439,15 @@ static void Arm_UpdateState(void)
         }
         else if(arm.state == ARM_STATE_DISABLED)
         {
-            for(int i = 0; i < motor_num; i++)
+            for(int i = 0; i < ARM_MOTOR_NUM; i++)
             {
                 DM_Motor_t *m = DM_Motor_Get(i);
-                if(m) { DM_Motor_Disable(m->hfdcan, m->can_id); osDelay(1); }
+                if(m) { DM_Motor_CmdAt(m->hfdcan, Arm_MotorIdBase(i), m->can_id, DM_CMD_DISABLE); osDelay(1); }
             }
             arm.q_offset_valid = 0;
             arm_q_offset_mask = 0;
             arm_catchup_mask = 0;
+            arm_grip_synced = 0;
         }
         arm.last_state = arm.state;
     }
@@ -424,11 +475,70 @@ static float Arm_RateLimit(float target, float current, float max_step)
     return target;
 }
 
+/* ===== 电机总线扫描（纯诊断，Watch 控制）==============================
+ * 用途：某个电机完全不回帧时，确认它到底在哪条总线、哪个 CAN ID、
+ *       哪种控制模式下才肯应答。
+ * 用法：遥控器拨到中档（LOCKED），在 Watch 里设
+ *         g_scan_bus = 1/2/3      要扫哪一路 FDCAN
+ *         g_scan_req = 1          开始
+ *       每个 2ms 周期只发一帧，4 种基址 x CAN ID 1~15 共 60 帧，约 120ms 扫完，
+ *       结束后 g_scan_req 自动回 0（扫 2/3 路时会顺便把该路停回去）。
+ * 读结果：扫 1 路看 can_rx_id_raw[] 哪个下标新增；
+ *         扫 2/3 路看 can_rx_bus_cnt[bus] 是否增长、can_rx_last_id[bus] 是多少。
+ *       三路都没有新 ID 出现 -> 电机不在任何一条 CAN 上（没接/没供电/波特率不符）。
+ * 为什么限定中档：扫描会对 ID 1~15 发使能帧，中档下 6 个关节本来就是使能并
+ *       锁位的，重复使能不改变任何状态；下档失能时扫会把关节意外上电。 */
+volatile uint8_t  g_scan_req  = 0;
+volatile uint8_t  g_scan_bus  = 1;
+volatile uint32_t g_scan_base = 0;
+volatile uint8_t  g_scan_id   = 0;
+
+static void Arm_BusScanTick(void)
+{
+    static const uint32_t bases[4] = {0x000u, 0x100u, 0x200u, 0x300u};
+    static uint8_t bi = 0, id = 1, started_bus = 0;
+
+    /* 退出扫描时必须把 2/3 路停回去：悬空收发器开着会往共用的 RX 回调里
+       灌噪声帧。记录"实际开起来的是哪一路"，这样扫描中途改 g_scan_bus
+       也不会把错误的一路留在运行状态。 */
+    if(!g_scan_req || arm.state != ARM_STATE_LOCKED)
+    {
+        if(started_bus) { BSP_FDCAN_StopAux(started_bus); started_bus = 0; }
+        if(!g_scan_req) { bi = 0; id = 1; }
+        return;
+    }
+
+    FDCAN_HandleTypeDef *h = (g_scan_bus == 2u) ? &hfdcan2
+                           : (g_scan_bus == 3u) ? &hfdcan3 : &hfdcan1;
+    uint8_t want_aux = (g_scan_bus == 2u || g_scan_bus == 3u) ? g_scan_bus : 0u;
+    if(started_bus != want_aux)
+    {
+        if(started_bus) BSP_FDCAN_StopAux(started_bus);
+        if(want_aux)    BSP_FDCAN_StartAux(want_aux);
+        started_bus = want_aux;
+    }
+
+    g_scan_base = bases[bi];
+    g_scan_id   = id;
+    DM_Motor_CmdAt(h, bases[bi], id, DM_CMD_ENABLE);
+
+    if(++id > 15u)
+    {
+        id = 1u;
+        if(++bi >= 4u)
+        {
+            bi = 0u;
+            if(started_bus) { BSP_FDCAN_StopAux(started_bus); started_bus = 0; }
+            g_scan_req = 0u;
+        }
+    }
+}
+
 void Arm_ControlLoop(void)
 {
     static uint32_t t_heal = 0;
     static uint8_t heal_enable_mask = 0;
-    static uint32_t heal_enable_due[ARM_JOINT_NUM] = {0};
+    static uint32_t heal_enable_due[ARM_MOTOR_NUM] = {0};
     uint32_t now = HAL_GetTick();
 
     /* 1s jitter window: publish peak-to-peak, then restart the window */
@@ -453,13 +563,13 @@ void Arm_ControlLoop(void)
 
     /* Keep the 2ms control task non-blocking. Queue enable 2ms after a clear
        command instead of sleeping inside the control loop. */
-    for(int i = 0; i < ARM_JOINT_NUM; i++)
+    for(int i = 0; i < ARM_MOTOR_NUM; i++)
     {
         uint8_t bit = (uint8_t)(1u << i);
         if((heal_enable_mask & bit) && (int32_t)(now - heal_enable_due[i]) >= 0)
         {
             DM_Motor_t *m = DM_Motor_Get(i);
-            if(m) DM_Motor_Enable(m->hfdcan, m->can_id);
+            if(m) DM_Motor_CmdAt(m->hfdcan, Arm_MotorIdBase(i), m->can_id, DM_CMD_ENABLE);
             heal_enable_mask &= (uint8_t)~bit;
         }
     }
@@ -469,14 +579,14 @@ void Arm_ControlLoop(void)
         t_heal = now;
         if(arm.state == ARM_STATE_LOCKED || arm.state == ARM_STATE_FOLLOWING)
         {
-            for(int i = 0; i < ARM_JOINT_NUM; i++)
+            for(int i = 0; i < ARM_MOTOR_NUM; i++)
             {
                 uint8_t bit = (uint8_t)(1u << i);
                 DM_Motor_t *m = DM_Motor_Get(i);
                 if(m && !(heal_enable_mask & bit) &&
                    (m->rx_cnt == 0 || m->error != 1))
                 {
-                    DM_Motor_ClearError(m->hfdcan, m->can_id);
+                    DM_Motor_CmdAt(m->hfdcan, Arm_MotorIdBase(i), m->can_id, DM_CMD_CLEAR_ERR);
                     heal_enable_due[i] = now + 2u;
                     heal_enable_mask |= bit;
                 }
@@ -485,6 +595,8 @@ void Arm_ControlLoop(void)
     }
 
     Arm_UpdateState();
+
+    Arm_BusScanTick();
 
     /* After a long outage, treat the newly received master pose as the new
        clutch point. Shorter gaps keep following, with reduced slew instead. */
@@ -598,54 +710,69 @@ void Arm_ControlLoop(void)
 
 #if ARM_USE_GRIPPER
     /* ===== 夹爪：第 7 个电机（索引 ARM_JOINT_NUM = 6）=====
-     * 二值控制：主手按键 0 = 张开，1 = 闭合。
-     * 用和关节同样的 PVT 位置控制，自己带速率限制，避免砸到机械限位。
-     * 只在 FOLLOWER 跟随状态下动 —— 遥控器下档/中档时夹爪保持不动。 */
+     * 使能/清错走上面 200ms 的自愈巡检，条件和 6 个关节一致。
+     *
+     * 关键：控制帧必须像关节一样**无条件下发**，不能等 rx_cnt > 0。
+     * 达妙电机使能后长时间收不到控制帧会判通讯丢失自己退出使能，于是
+     * "清错→使能→绿一下→掉回红→200ms 后重来"，表现就是中档上档都没使能。
+     * 拿到第一帧反馈之前电流限值发 0：有保活、会回帧、没有力矩，
+     * 所以也不会因为目标还停在 0 而猛甩。
+     *
+     * 中档(LOCKED)：保持当前位置，和关节一样有保持力。
+     * 上档(FOLLOWING)：按主手按键开合，0 = 张开，1 = 闭合。 */
     {
+        static uint32_t t_grip_tx = 0;
         DM_Motor_t *gm = DM_Motor_Get(ARM_JOINT_NUM);
 
-        /* 使能重试：DM 电机只有在收到控制帧后才会回帧，所以不能用
-           "rx_cnt > 0 才发指令" 来判断 —— 那会死锁（不发→不回→不敢发）。
-           这里改成：只要它还没应答，就每 500ms 补发一次 清错+使能。 */
-        if(gm != NULL && gm->hfdcan != NULL && gm->rx_cnt == 0)
-        {
-            static uint32_t grip_en_tick = 0;
-            if((HAL_GetTick() - grip_en_tick) > 500u)
-            {
-                grip_en_tick = HAL_GetTick();
-                DM_Motor_ClearError(gm->hfdcan, gm->can_id);
-                DM_Motor_Enable(gm->hfdcan, gm->can_id);
-            }
-        }
-
         if(gm != NULL && gm->hfdcan != NULL &&
-           arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active)
+           (uint32_t)(now - t_grip_tx) >= GRIP_TX_PERIOD_MS)
         {
-            /* 第一次收到夹爪反馈时，把目标对齐到它当前的实际位置，
-               否则 arm.target_gripper 从 0 起爬，会先朝 0 走一大段。 */
-            static uint8_t grip_synced = 0;
-            if(!grip_synced && gm->rx_cnt > 0)
+            t_grip_tx = now;
+
+            float cur = 0.0f;
+
+            if(gm->rx_cnt > 0)
             {
-                arm.target_gripper = gm->position;
-                grip_synced = 1;
+                if(!arm_grip_synced)
+                {
+                    arm.target_gripper = gm->position;
+                    arm_grip_synced = 1;
+                }
+                cur = g_grip_cur;
+
+                /* 只有上档且主手在线使能时才推动目标；中档保持上一次的目标不动。 */
+                if(arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active)
+                {
+                    float want = arm.gripper_cmd_recv ? g_grip_close : g_grip_open;
+                    float err  = want - arm.target_gripper;
+
+                    if(fabsf(err) > 1e-4f)
+                    {
+                        float step = (err > 0.0f) ? g_grip_step : -g_grip_step;
+                        if(fabsf(err) < g_grip_step) step = err;
+                        arm.target_gripper += step;
+                    }
+                }
+
+                /* 软限位：目标不出 g_grip_open / g_grip_close 划出的区间（谁大谁小都行，
+                   方向反了对调两个值即可）。 */
+                float lo = (g_grip_open < g_grip_close) ? g_grip_open  : g_grip_close;
+                float hi = (g_grip_open < g_grip_close) ? g_grip_close : g_grip_open;
+                if(arm.target_gripper < lo) arm.target_gripper = lo;
+                if(arm.target_gripper > hi) arm.target_gripper = hi;
+
+                /* 限幅跟踪误差 = 限幅夹持力，同时防止堵转满电流死顶 */
+                float lag = arm.target_gripper - gm->position;
+                if(lag >  GRIP_MAX_LAG) arm.target_gripper = gm->position + GRIP_MAX_LAG;
+                if(lag < -GRIP_MAX_LAG) arm.target_gripper = gm->position - GRIP_MAX_LAG;
             }
 
-            float want = arm.gripper_cmd_recv ? g_grip_close : g_grip_open;
-            float err  = want - arm.target_gripper;
-
-            if(fabsf(err) > 1e-4f)
-            {
-                float step = (err > 0.0f) ? g_grip_step : -g_grip_step;
-                if(fabsf(err) < g_grip_step) step = err;
-                arm.target_gripper += step;
-            }
-
-            float gvel = g_grip_step / ARM_CTRL_PERIOD_S;
+            float gvel = g_grip_step / GRIP_TX_PERIOD_S;
             if(gvel > ARM_VEL_MAX_RAD_S) gvel = ARM_VEL_MAX_RAD_S;
             if(gvel < ARM_VEL_MIN_RAD_S) gvel = ARM_VEL_MIN_RAD_S;
 
             DM_Motor_PVT_Control(gm->hfdcan, gm->can_id,
-                                 arm.target_gripper, gvel, GRIP_CUR_LIMIT);
+                                 arm.target_gripper, gvel, cur);
         }
     }
 #endif

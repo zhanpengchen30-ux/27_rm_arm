@@ -54,6 +54,11 @@ typedef struct
 // 初始化所有达妙电机
 void DM_Motor_Init(void);
 
+// 按指定控制模式基址发命令。基址必须和电机自身 CTRL_MODE 一致，否则整帧被忽略：
+//   0x000 = MIT   0x100 = 位置速度   0x200 = 速度   0x300 = 位置力矩混合
+void DM_Motor_CmdAt(FDCAN_HandleTypeDef *hfdcan, uint32_t id_base,
+                    uint8_t motor_id, uint8_t cmd);
+
 // 使能单个电机
 void DM_Motor_Enable(FDCAN_HandleTypeDef *hfdcan, uint8_t motor_id);
 

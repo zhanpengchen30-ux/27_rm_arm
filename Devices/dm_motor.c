@@ -104,11 +104,24 @@ void DM_Motor_Init(void)
     dm_motors[6].tau_max = 10.0f;
 }
 
+// 按指定的控制模式基址发送一条命令帧。
+// DM 电机只接受与自身 CTRL_MODE 参数相符的基址：
+//   0x000 = MIT   0x100 = 位置速度   0x200 = 速度   0x300 = 位置力矩混合
+// 基址不符时电机会**完全忽略**该帧 —— 不回帧、不使能、不报错，
+// 外部表现就是"使能帧照发，电机一动不动"。新装的电机忘了改 CTRL_MODE
+// 是最常见的原因。
+void DM_Motor_CmdAt(FDCAN_HandleTypeDef *hfdcan, uint32_t id_base,
+                    uint8_t motor_id, uint8_t cmd)
+{
+    uint8_t data[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+    data[7] = cmd;
+    DM_CAN_Send(hfdcan, id_base + motor_id, data);
+}
+
 // Enable motor (PVT/Hybrid mode: frame ID = 0x300 + motor_id)
 void DM_Motor_Enable(FDCAN_HandleTypeDef *hfdcan, uint8_t motor_id)
 {
-    uint8_t data[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, DM_CMD_ENABLE};
-    DM_CAN_Send(hfdcan, 0x300 + motor_id, data);
+    DM_Motor_CmdAt(hfdcan, 0x300u, motor_id, DM_CMD_ENABLE);
 }
 
 // 清除锁存错误 (0xFB)
@@ -116,8 +129,7 @@ void DM_Motor_Enable(FDCAN_HandleTypeDef *hfdcan, uint8_t motor_id)
 // 此时无论发多少次使能帧都不会变绿，必须先清错。
 void DM_Motor_ClearError(FDCAN_HandleTypeDef *hfdcan, uint8_t motor_id)
 {
-    uint8_t data[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, DM_CMD_CLEAR_ERR};
-    DM_CAN_Send(hfdcan, 0x300 + motor_id, data);
+    DM_Motor_CmdAt(hfdcan, 0x300u, motor_id, DM_CMD_CLEAR_ERR);
 }
 
 // 调试用：读 FDCAN 错误状态
@@ -135,15 +147,13 @@ void DM_Motor_GetBusError(FDCAN_HandleTypeDef *hfdcan, uint8_t *tx_err, uint8_t 
 // Disable motor (PVT/Hybrid mode: frame ID = 0x300 + motor_id)
 void DM_Motor_Disable(FDCAN_HandleTypeDef *hfdcan, uint8_t motor_id)
 {
-    uint8_t data[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, DM_CMD_DISABLE};
-    DM_CAN_Send(hfdcan, 0x300 + motor_id, data);
+    DM_Motor_CmdAt(hfdcan, 0x300u, motor_id, DM_CMD_DISABLE);
 }
 
 // Set current angle as zero (PVT/Hybrid mode: frame ID = 0x300 + motor_id, 0xFE)
 void DM_Motor_SetZero(FDCAN_HandleTypeDef *hfdcan, uint8_t motor_id)
 {
-    uint8_t data[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, DM_CMD_SET_ZERO};
-    DM_CAN_Send(hfdcan, 0x300 + motor_id, data);
+    DM_Motor_CmdAt(hfdcan, 0x300u, motor_id, DM_CMD_SET_ZERO);
 }
 
 // Position-velocity mode (0x100 frame), kept as backup

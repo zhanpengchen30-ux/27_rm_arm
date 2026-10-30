@@ -12,10 +12,15 @@
 
 /* 夹爪开/合目标位置（rad），Watch 里可实时改。
    未知量程时先用小步长试：把 g_grip_close 从 0 慢慢加大，观察夹爪行程，
-   找到刚好夹紧又不变形的角度后再写死。方向反了就对调两个值。 */
+   找到刚好夹紧又不变形的角度后再写死。方向反了就对调两个值。
+   这两个值同时也是目标的软限位。 */
 extern volatile float g_grip_open;
 extern volatile float g_grip_close;
-extern volatile float g_grip_step;   /* 每个 2ms 控制周期的最大步进(rad) */
+extern volatile float g_grip_step;   /* 每个夹爪下发周期(10ms)的最大步进(rad) */
+
+/* 夹爪电流限值：**额定电流的标幺值**，不是安培（PVT 帧内部 ×10000，上限 1.0）。
+   4310 额定 2.5A，所以 0.9 ≈ 2.25A。夹不紧往上调，但别超过 1.0。 */
+extern volatile float g_grip_cur;
 
 // Zigbee接收帧格式 (18字节)
 // 0xAA + 6*int16(0.001rad) + active + grip + seq + crc8 + 0x55
@@ -25,7 +30,7 @@ extern volatile float g_grip_step;   /* 每个 2ms 控制周期的最大步进(r
 #define ZIGBEE_ACTIVE_OFFSET 13
 #define ZIGBEE_GRIP_OFFSET   14
 #define ZIGBEE_SEQ_OFFSET    15
-#define ZIGBEE_FRAME_LEN     18
+#define ZIGBEE_FRAME_LEN     18u
 
 #define ARM_RX_TIMEOUT_MS    500
 

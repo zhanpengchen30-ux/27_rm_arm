@@ -6,14 +6,20 @@
 
 #define ARM_JOINT_NUM   6
 
-// 夹爪暂时不上机：0 = 完全不驱动夹爪电机（不使能、不下发控制帧）
-// 注意：主手侧的开关还没进通信协议，夹爪状态目前传不过来
-#define ARM_USE_GRIPPER 0
+// 夹爪：0 = 完全不驱动（不使能、不下发控制帧）
+//       1 = 使能第 7 个电机并按主手按键开合（2026-10-30 打开）
+#define ARM_USE_GRIPPER 1
+
+/* 夹爪开/合目标位置（rad），Watch 里可实时改。
+   未知量程时先用小步长试：把 g_grip_close 从 0 慢慢加大，观察夹爪行程，
+   找到刚好夹紧又不变形的角度后再写死。方向反了就对调两个值。 */
+extern volatile float g_grip_open;
+extern volatile float g_grip_close;
+extern volatile float g_grip_step;   /* 每个 2ms 控制周期的最大步进(rad) */
 
 // Zigbee接收帧格式 (18字节)
 // 0xAA + 6*int16(0.001rad) + active + grip + seq + crc8 + 0x55
-// 2026-10-29: 主手加夹爪按键，帧从 17 变 18，grip 插在 active 后面。
-// ⚠ 主手 27_custroller/Apps/zigbee.c 的 Zigbee_SendJoints 必须与此一致。
+// 2026-10-30: 主手加夹爪按键，grip 插在 active 后面，帧 17 -> 18
 #define ZIGBEE_HEAD          0xAA
 #define ZIGBEE_TAIL          0x55
 #define ZIGBEE_ACTIVE_OFFSET 13

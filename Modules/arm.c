@@ -115,8 +115,8 @@ static const float ARM_DIR[ARM_JOINT_NUM] = {
     1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f
 };
 
-static const float ARM_Q_MIN[ARM_JOINT_NUM] = { -3.10f, -2.80f, -0.65f, -10.0f, -10.0f, -10.0f};
-static const float ARM_Q_MAX[ARM_JOINT_NUM] = {  0.05f,  0.05f,  1.90f,  10.0f,  10.0f,  10.0f};
+static const float ARM_Q_MIN[ARM_JOINT_NUM] = { -3.10f, -2.80f,  -2.40f, -10.0f, -10.0f, -10.0f};
+static const float ARM_Q_MAX[ARM_JOINT_NUM] = {  0.05f,  0.05f,  0.23f,  10.0f,  10.0f,  10.0f};
 
 static const float ARM_CUR_LIMIT[ARM_JOINT_NUM] = {
     0.7f,  0.7f,  0.7f,  0.7f,  0.7f,  0.7f
@@ -129,13 +129,22 @@ static float Arm_ClampJoint(int i, float v)
     return v;
 }
 
+/* 夹爪开/合目标位置（rad）。未知量程，默认给一个保守的小行程；
+   实机上在 Watch 里从 0 慢慢加大 g_grip_close，找到刚好夹紧的角度。 */
+volatile float g_grip_open  = 0.0f;
+volatile float g_grip_close = 0.5f;
+volatile float g_grip_step  = 0.002f;   /* 2ms 一拍，0.002 rad ≈ 1 rad/s */
+
+/* 夹爪电流限值（A）。关节用的是 0.7A，夹爪需要更大才能夹住东西；
+   2.0A 对 4310 是安全的连续值。夹不紧就往上加，别超过 4A。 */
+#define GRIP_CUR_LIMIT   2.0f
+
 static void Arm_DecodeFrame(uint8_t active, uint8_t grip, uint8_t seq)
 {
     uint32_t now = HAL_GetTick();
     uint8_t long_gap = 0;
     uint8_t reacquire = (active && !arm.active);
 
-    /* 主手夹爪按键：0=开 1=合。先只记录，驱动逻辑见下方 ARM_USE_GRIPPER。 */
     arm.gripper_cmd_recv = grip;
     if(arm.recv_cnt > 0)
     {
@@ -222,7 +231,7 @@ void Arm_Zigbee_ParseByte(uint8_t byte)
 
     if(zigbee_idx == ZIGBEE_FRAME_LEN)
     {
-        uint8_t crc_calc = Zigbee_Crc8(zigbee_buf, (uint8_t)(ZIGBEE_FRAME_LEN - 2u)); /* [0..14] */
+        uint8_t crc_calc = Zigbee_Crc8(zigbee_buf, (uint8_t)(ZIGBEE_FRAME_LEN - 2u)); /* [0..15] */
         if(zigbee_buf[ZIGBEE_FRAME_LEN - 1u] == 0x55 &&
            crc_calc == zigbee_buf[ZIGBEE_FRAME_LEN - 2u])
         {
@@ -584,6 +593,36 @@ void Arm_ControlLoop(void)
                              arm.cmd_smooth[i], vmag, ARM_CUR_LIMIT[i]);
 
     }
+
+#if ARM_USE_GRIPPER
+    /* ===== 夹爪：第 7 个电机（索引 ARM_JOINT_NUM = 6）=====
+     * 二值控制：主手按键 0 = 张开，1 = 闭合。
+     * 用和关节同样的 PVT 位置控制，自己带速率限制，避免砸到机械限位。
+     * 只在 FOLLOWER 跟随状态下动 —— 遥控器下档/中档时夹爪保持不动。 */
+    {
+        DM_Motor_t *gm = DM_Motor_Get(ARM_JOINT_NUM);
+        if(gm != NULL && gm->hfdcan != NULL && gm->rx_cnt > 0 &&
+           arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active)
+        {
+            float want = arm.gripper_cmd_recv ? g_grip_close : g_grip_open;
+            float err  = want - arm.target_gripper;
+
+            if(fabsf(err) > 1e-4f)
+            {
+                float step = (err > 0.0f) ? g_grip_step : -g_grip_step;
+                if(fabsf(err) < g_grip_step) step = err;
+                arm.target_gripper += step;
+            }
+
+            float gvel = g_grip_step / ARM_CTRL_PERIOD_S;
+            if(gvel > ARM_VEL_MAX_RAD_S) gvel = ARM_VEL_MAX_RAD_S;
+            if(gvel < ARM_VEL_MIN_RAD_S) gvel = ARM_VEL_MIN_RAD_S;
+
+            DM_Motor_PVT_Control(gm->hfdcan, gm->can_id,
+                                 arm.target_gripper, gvel, GRIP_CUR_LIMIT);
+        }
+    }
+#endif
 }
 
 Arm_t* Arm_Get(void)

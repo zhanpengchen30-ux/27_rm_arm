@@ -11,6 +11,12 @@ volatile uint32_t can_rx_drop = 0;
 /* 分总线统计，给扫描用：下标 1/2/3 对应 FDCAN1/2/3 */
 volatile uint32_t can_rx_bus_cnt[4] = {0};
 volatile uint32_t can_rx_last_id[4] = {0};
+/* FDCAN1 上不属于 6 个已知关节（Master ID 0x11~0x16）的帧。
+   夹爪如果回帧用的 Master ID 不是 0x17（比如出厂默认 0x00，或者根本
+   没设过），就会落进这个计数器 —— 这样"回了但 ID 不对"和"完全没回"
+   就能区分开。can_rx_other_id 记录最后一帧这种帧的 ID。 */
+volatile uint32_t can_rx_other_cnt = 0;
+volatile uint32_t can_rx_other_id  = 0;
 
 /* 按需启停 FDCAN2/3。平时它们是停的（悬空的收发器会收到噪声，当初
    就是因此在共用的 RX 回调里统计到幽灵帧），只在扫描电机时临时打开。 */
@@ -123,8 +129,17 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
                 /* 按原始 ID 统计，用来判断某个电机到底有没有回帧、
                    以及回帧用的 Master ID 是不是设对了。
                    达妙电机的 Master ID 应为 0x11~0x17（对应 CAN ID 1~7）。 */
-                if(hfdcan->Instance == FDCAN1 && rx_header.Identifier < 32u)
-                    can_rx_id_raw[rx_header.Identifier]++;
+                if(hfdcan->Instance == FDCAN1)
+                {
+                    if(rx_header.Identifier < 32u)
+                        can_rx_id_raw[rx_header.Identifier]++;
+
+                    if(rx_header.Identifier < 0x11u || rx_header.Identifier > 0x16u)
+                    {
+                        can_rx_other_cnt++;
+                        can_rx_other_id = rx_header.Identifier;
+                    }
+                }
 
                 {
                     uint8_t bus = (hfdcan->Instance == FDCAN1) ? 1u

@@ -156,8 +156,10 @@ volatile float g_grip_close = 2.10f;
 #define GRIP_TX_PERIOD_MS   10u
 #define GRIP_TX_PERIOD_S    0.010f
 
-/* 每个下发周期的最大步进(rad)。0.01 rad / 10ms = 1 rad/s。 */
-volatile float g_grip_step  = 0.03f;   /* 10ms 一拍，0.03 rad ≈ 3 rad/s；全程 3.82rad 约 1.3s */
+/* 每个下发周期的最大步进(rad)，10ms 一拍，所以数值 x100 就是 rad/s。
+   0.15 = 15 rad/s，全程 3.82rad 约 0.25s。再快没有意义 ——
+   GRIP_MAX_LAG(0.15rad) 会把目标超前量钳住，实际速度由电机跟得上多少决定。 */
+volatile float g_grip_step  = 0.15f;
 
 /* 夹爪电流限值，单位同 ARM_CUR_LIMIT —— **额定电流的标幺值**，不是安培。
    4310 额定 2.5A，所以 0.9 ≈ 2.25A，1.0 就已经是满额定。

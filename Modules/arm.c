@@ -129,10 +129,12 @@ static float Arm_ClampJoint(int i, float v)
     return v;
 }
 
-/* 夹爪开/合目标位置（rad）。未知量程，默认给一个保守的小行程；
-   实机上在 Watch 里从 0 慢慢加大 g_grip_close，找到刚好夹紧的角度。 */
-volatile float g_grip_open  = 0.0f;
-volatile float g_grip_close = 0.5f;
+/* 夹爪开/合目标位置（rad）。
+   2026-10-30 串口 dump 读到电机当前位置 Output Position = 1.7238，
+   所以默认值放在它附近，避免第一次下发时从 0 猛甩过去。
+   方向未知：先小步试，看夹爪往哪边走，反了就把两个值对调。 */
+volatile float g_grip_open  = 1.72f;
+volatile float g_grip_close = 2.10f;
 volatile float g_grip_step  = 0.002f;   /* 2ms 一拍，0.002 rad ≈ 1 rad/s */
 
 /* 夹爪电流限值（A）。关节用的是 0.7A，夹爪需要更大才能夹住东西；
@@ -601,9 +603,33 @@ void Arm_ControlLoop(void)
      * 只在 FOLLOWER 跟随状态下动 —— 遥控器下档/中档时夹爪保持不动。 */
     {
         DM_Motor_t *gm = DM_Motor_Get(ARM_JOINT_NUM);
-        if(gm != NULL && gm->hfdcan != NULL && gm->rx_cnt > 0 &&
+
+        /* 使能重试：DM 电机只有在收到控制帧后才会回帧，所以不能用
+           "rx_cnt > 0 才发指令" 来判断 —— 那会死锁（不发→不回→不敢发）。
+           这里改成：只要它还没应答，就每 500ms 补发一次 清错+使能。 */
+        if(gm != NULL && gm->hfdcan != NULL && gm->rx_cnt == 0)
+        {
+            static uint32_t grip_en_tick = 0;
+            if((HAL_GetTick() - grip_en_tick) > 500u)
+            {
+                grip_en_tick = HAL_GetTick();
+                DM_Motor_ClearError(gm->hfdcan, gm->can_id);
+                DM_Motor_Enable(gm->hfdcan, gm->can_id);
+            }
+        }
+
+        if(gm != NULL && gm->hfdcan != NULL &&
            arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active)
         {
+            /* 第一次收到夹爪反馈时，把目标对齐到它当前的实际位置，
+               否则 arm.target_gripper 从 0 起爬，会先朝 0 走一大段。 */
+            static uint8_t grip_synced = 0;
+            if(!grip_synced && gm->rx_cnt > 0)
+            {
+                arm.target_gripper = gm->position;
+                grip_synced = 1;
+            }
+
             float want = arm.gripper_cmd_recv ? g_grip_close : g_grip_open;
             float err  = want - arm.target_gripper;
 

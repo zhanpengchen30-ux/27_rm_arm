@@ -147,7 +147,7 @@ static float Arm_ClampJoint(int i, float v)
    所以默认值放在它附近，避免第一次下发时从 0 猛甩过去。
    方向未知：先小步试，看夹爪往哪边走，反了就把两个值对调。
    两个值定义的区间同时也是目标的软限位，Watch 里填错也只会停在区间边界。 */
-volatile float g_grip_open  = 1.72f;
+volatile float g_grip_open  = -1.72f;
 volatile float g_grip_close = 2.10f;
 
 /* 夹爪专用的下发周期。开合是二值动作，不需要跟关节一样 500Hz ——
@@ -174,43 +174,38 @@ volatile float g_grip_cur = 0.9f;
    上电后第一帧就会命令它猛甩一大段。失能时清零，下次使能重新对齐。 */
 static uint8_t arm_grip_synced = 0;
 
-/* 夹爪命令帧的控制模式基址。6 个关节已确认是"位置力矩混合"(0x300)，
-   夹爪是后装的电机，它的 CTRL_MODE 参数未必改过 —— 基址和电机实际模式
-   不一致时，电机会完全忽略整帧（不回帧、不使能），表现就是怎么发都不动。
-   在 Keil Watch 里改这个值可以不重新编译就试出它真正的模式：
-     0x000 = MIT   0x100 = 位置速度   0x200 = 速度   0x300 = 位置力矩混合
-   注意：PVT 控制帧固定走 0x300，所以试出来不是 0x300 的话，
-   正确做法是用达妙上位机把 CTRL_MODE 改成混合模式，而不是留在这里。 */
+/* 夹爪命令帧的首选控制模式基址。6 个关节已确认是"力位混合"(0x300)，
+   夹爪是后装的电机，串口 dump 读到 Control Mode: 4（力位混合），所以 0x300
+   应该是对的。但使能/清错/失能帧仍会把四种基址都发一遍（见 Arm_SendCmd），
+   这里只决定先发哪一个 —— 万一 dump 读错了也不至于全盘落空。
+   想单独试某一种模式，在 Watch 里把这个值改成 0x000/0x100/0x200/0x300 即可。 */
 volatile uint32_t g_grip_id_base = 0x300u;
-
-static uint32_t Arm_MotorIdBase(int i)
-{
-#if ARM_USE_GRIPPER
-    if(i == ARM_JOINT_NUM) return g_grip_id_base;
-#endif
-    return 0x300u;
-}
 
 /* 发一条命令帧到第 i 台电机。
  *
  * 前 6 个关节一直用 0x300+id，工作正常。
- * 第 7 台（夹爪）的控制模式未知 —— 串口 dump 显示 Control Mode: 4，
- * 而不同模式认的 ID 段不一样（0x300=PVT/混合、0x000=MIT、0x100=位置速度）。
- * 与其继续猜，使能/清错这类命令帧对夹爪同时发两个基址：多发一帧的代价，
- * 换来"不用先弄清模式也能使能"。哪个生效就以哪个为准（看 rx_cnt 涨不涨）。
- * 控制帧仍走 g_grip_id_base，等确认模式后再定。 */
+ * 第 7 台（夹爪）的控制模式虽然从串口 dump 里读到 Control Mode: 4，
+ * 但为了不再靠猜，使能/清错/失能这类命令帧对夹爪把四种模式的基址各发一遍
+ * （0x000=MIT 0x100=位置速度 0x200=速度 0x300=力位混合）。
+ * 这些是 0xFB/0xFC/0xFD 特殊命令帧，不含位置数据，所以命中或落空都不会让
+ * 电机乱动；哪个基址生效看 dm_motors[6].rx_cnt 涨不涨就知道了。
+ * 控制帧（PVT）仍固定走 0x300。 */
 static void Arm_SendCmd(DM_Motor_t *m, int i, uint32_t cmd)
 {
 #if ARM_USE_GRIPPER
     if(i == ARM_JOINT_NUM)
     {
+        static const uint32_t bases[4] = {0x000u, 0x100u, 0x200u, 0x300u};
         DM_Motor_CmdAt(m->hfdcan, g_grip_id_base, m->can_id, cmd);
-        if(g_grip_id_base != 0x300u) DM_Motor_CmdAt(m->hfdcan, 0x300u, m->can_id, cmd);
-        if(g_grip_id_base != 0x000u) DM_Motor_CmdAt(m->hfdcan, 0x000u, m->can_id, cmd);
+        for(int b = 0; b < 4; b++)
+        {
+            if(bases[b] != g_grip_id_base)
+                DM_Motor_CmdAt(m->hfdcan, bases[b], m->can_id, cmd);
+        }
         return;
     }
 #endif
-    DM_Motor_CmdAt(m->hfdcan, Arm_MotorIdBase(i), m->can_id, cmd);
+    DM_Motor_CmdAt(m->hfdcan, 0x300u, m->can_id, cmd);
 }
 
 static void Arm_DecodeFrame(uint8_t active, uint8_t grip, uint8_t seq)
@@ -464,7 +459,7 @@ static void Arm_UpdateState(void)
             for(int i = 0; i < ARM_MOTOR_NUM; i++)
             {
                 DM_Motor_t *m = DM_Motor_Get(i);
-                if(m) { DM_Motor_CmdAt(m->hfdcan, Arm_MotorIdBase(i), m->can_id, DM_CMD_DISABLE); osDelay(1); }
+                if(m) { Arm_SendCmd(m, i, DM_CMD_DISABLE); osDelay(1); }
             }
             arm.q_offset_valid = 0;
             arm_q_offset_mask = 0;
@@ -591,7 +586,7 @@ void Arm_ControlLoop(void)
         if((heal_enable_mask & bit) && (int32_t)(now - heal_enable_due[i]) >= 0)
         {
             DM_Motor_t *m = DM_Motor_Get(i);
-            if(m) DM_Motor_CmdAt(m->hfdcan, Arm_MotorIdBase(i), m->can_id, DM_CMD_ENABLE);
+            if(m) Arm_SendCmd(m, i, DM_CMD_ENABLE);
             heal_enable_mask &= (uint8_t)~bit;
         }
     }
@@ -608,7 +603,7 @@ void Arm_ControlLoop(void)
                 if(m && !(heal_enable_mask & bit) &&
                    (m->rx_cnt == 0 || m->error != 1))
                 {
-                    DM_Motor_CmdAt(m->hfdcan, Arm_MotorIdBase(i), m->can_id, DM_CMD_CLEAR_ERR);
+                    Arm_SendCmd(m, i, DM_CMD_CLEAR_ERR);
                     heal_enable_due[i] = now + 2u;
                     heal_enable_mask |= bit;
                 }
@@ -745,6 +740,25 @@ void Arm_ControlLoop(void)
     {
         static uint32_t t_grip_tx = 0;
         DM_Motor_t *gm = DM_Motor_Get(ARM_JOINT_NUM);
+
+        /* 夹爪清错重试（2026-10-30）。
+           达妙电机有错误位锁存：error != 0 时怎么发使能都不生效（LED 红灯常亮）。
+           原来的清错只在 "DISABLED -> 其它" 那一次状态切换时发，一旦电机在上电
+           顺序里错过那一帧（或先报错再使能），就再也清不掉了。
+           这里改成：只要 error 还不是 0，就每 500ms 补一次 清错 + 使能。
+           顺带说明：dm_motors[].enabled 这个字段反馈报文里没有，ParseFeedback
+           从不写它，所以它恒为 0 —— 判断有没有真使能要看电机 LED。 */
+        if(gm != NULL && gm->hfdcan != NULL && gm->error != 0)
+        {
+            static uint32_t grip_clr_tick = 0;
+            if((HAL_GetTick() - grip_clr_tick) > 500u)
+            {
+                grip_clr_tick = HAL_GetTick();
+                Arm_SendCmd(gm, ARM_JOINT_NUM, DM_CMD_CLEAR_ERR);
+                osDelay(1);
+                Arm_SendCmd(gm, ARM_JOINT_NUM, DM_CMD_ENABLE);
+            }
+        }
 
         if(gm != NULL && gm->hfdcan != NULL &&
            (uint32_t)(now - t_grip_tx) >= GRIP_TX_PERIOD_MS)

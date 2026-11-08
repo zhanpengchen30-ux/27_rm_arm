@@ -30,7 +30,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "bsp_dwt.h"
-
+extern void Arm_EmergencyStop(void);   /* 定义在 Modules/arm.c */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -242,7 +242,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
+  /* 启动期/运行期 HAL 失败：先把电机全部失能再停死，避免顶死飞车。
+     这里不复位——启动期失败进复位循环更糟；运行期挂死由 Mon_Task/故障入口复位。 */
+  Arm_EmergencyStop();
   __disable_irq();
   while (1)
   {

@@ -50,6 +50,11 @@ static void DM_CAN_Send(FDCAN_HandleTypeDef *hfdcan, uint32_t std_id, uint8_t *d
 }
 
 // 7 motors, types from bottom: J1=4340, J2=J8009, J3=4340, J4=4310, J5=4310, J6=6220, Gripper=4310
+/* 当前布线：7 台全在 CAN1 = PD0/PD1（单条 1Mbps，6 轴 PVT@500Hz + 回执 ≈ 80% 负载）。
+   想拆成两条各 ~40% 要同时改三处：本文件的 hfdcan 指向、bsp_can.c 里 FDCAN2 的
+   启动与反馈解析、fdcan.c 里 hfdcan2.AutoRetransmission（CubeMX 重新生成会把它冲回 DISABLE）。
+   反馈按 (总线句柄, CAN ID) 双重匹配，所以不同总线上的 ID 可以重复；
+   达妙 Master ID 只认 0x11~0x17，一条总线最多 7 台。 */
 void DM_Motor_Init(void)
 {
     memset(dm_motors, 0, sizeof(dm_motors));
@@ -228,6 +233,9 @@ void DM_Motor_PVT_Control(FDCAN_HandleTypeDef *hfdcan, uint8_t motor_id,
 // Parse feedback (Master ID = 0x11~0x17, low 4 bits = motor CAN ID)
 void DM_Motor_ParseFeedback(FDCAN_HandleTypeDef *hfdcan, uint32_t can_id, uint8_t *data)
 {
+    /* 严格白名单：达妙反馈 Master ID 只可能是 0x11~0x17，
+       其它标准帧(0x000/0x7FF/第三方设备)一律丢弃，防污染关节状态 */
+    if(can_id < 0x11u || can_id > 0x17u) return;
     uint8_t motor_id = can_id & 0x0F;
 
     for(int i = 0; i < DM_MOTOR_NUM; i++)
@@ -246,6 +254,7 @@ void DM_Motor_ParseFeedback(FDCAN_HandleTypeDef *hfdcan, uint32_t can_id, uint8_
             dm_motors[i].mos_temp = data[6];
             dm_motors[i].rotor_temp = data[7];
             dm_motors[i].rx_cnt++;
+            dm_motors[i].last_rx_tick = HAL_GetTick();
             break;
         }
     }

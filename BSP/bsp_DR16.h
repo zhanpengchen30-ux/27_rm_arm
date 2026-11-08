@@ -53,7 +53,6 @@ typedef struct
 
 
 
-extern osMessageQueueId_t rcQueueHandle;
 
 
 //Ò£¿ØÆ÷³õÊ¼»¯

@@ -23,7 +23,6 @@
 /* USER CODE BEGIN 0 */
 #include "bsp_dr16.h"
 #include "arm.h"
-static uint8_t zigbee_rx_byte = 0;
 /* USER CODE END 0 */
 
 UART_HandleTypeDef huart5;

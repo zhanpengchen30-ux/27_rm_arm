@@ -1042,11 +1042,6 @@
               <FilePath>..\Algorithm\iir_filter.c</FilePath>
             </File>
             <File>
-              <FileName>MahonyAHRS.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Algorithm\MahonyAHRS.c</FilePath>
-            </File>
-            <File>
               <FileName>pid.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Algorithm\pid.c</FilePath>
@@ -1055,16 +1050,6 @@
               <FileName>smc.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Algorithm\smc.c</FilePath>
-            </File>
-            <File>
-              <FileName>kalman_filter.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Algorithm\kalman_filter.c</FilePath>
-            </File>
-            <File>
-              <FileName>QuaternionEKF.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Algorithm\QuaternionEKF.c</FilePath>
             </File>
             <File>
               <FileName>LADRC.c</FileName>
@@ -1095,16 +1080,6 @@
           <GroupName>Devices</GroupName>
           <Files>
             <File>
-              <FileName>bmi088driver.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Devices\bmi088driver.c</FilePath>
-            </File>
-            <File>
-              <FileName>bmi088middleware.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Devices\bmi088middleware.c</FilePath>
-            </File>
-            <File>
               <FileName>ws2812.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Devices\ws2812.c</FilePath>
@@ -1119,11 +1094,6 @@
         <Group>
           <GroupName>Task</GroupName>
           <Files>
-            <File>
-              <FileName>INS_task.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Task\INS_task.c</FilePath>
-            </File>
             <File>
               <FileName>arm_task.c</FileName>
               <FileType>1</FileType>

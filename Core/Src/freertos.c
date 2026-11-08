@@ -26,7 +26,6 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "cmsis_os2.h"
-#include "INS_task.h"
 #include "bsp_DR16.h"
 #include "bsp_buzzer.h"
 #include "arm_task.h"
@@ -64,18 +63,6 @@ const osThreadAttr_t All_Init_attributes = {
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityHigh7,
 };
-/* Definitions for INSTask */
-osThreadId_t INSTaskHandle;
-uint32_t IMU_Buffer[ 1024 ];
-osStaticThreadDef_t IMUControlBlock;
-const osThreadAttr_t INSTask_attributes = {
-  .name = "INSTask",
-  .cb_mem = &IMUControlBlock,
-  .cb_size = sizeof(IMUControlBlock),
-  .stack_mem = &IMU_Buffer[0],
-  .stack_size = sizeof(IMU_Buffer),
-  .priority = (osPriority_t) osPriorityRealtime,
-};
 /* Definitions for CanDecodeTask */
 osThreadId_t CanDecodeTaskHandle;
 const osThreadAttr_t CanDecodeTask_attributes = {
@@ -90,6 +77,13 @@ const osThreadAttr_t ArmTask_attributes = {
   .stack_size = 1024 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
+/* Definitions for MonTask */
+osThreadId_t MonTaskHandle;
+const osThreadAttr_t MonTask_attributes = {
+  .name = "MonTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityHigh,
+};
 /* Definitions for rcTask */
 osThreadId_t rcTaskHandle;
 const osThreadAttr_t rcTask_attributes = {
@@ -97,20 +91,10 @@ const osThreadAttr_t rcTask_attributes = {
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityBelowNormal,
 };
-/* Definitions for rcQueue */
-osMessageQueueId_t rcQueueHandle;
-const osMessageQueueAttr_t rcQueue_attributes = {
-  .name = "rcQueue"
-};
 /* Definitions for canRxQueue */
 osMessageQueueId_t canRxQueueHandle;
 const osMessageQueueAttr_t canRxQueue_attributes = {
   .name = "canRxQueue"
-};
-/* Definitions for imuBinarySem01 */
-osSemaphoreId_t imuBinarySem01Handle;
-const osSemaphoreAttr_t imuBinarySem01_attributes = {
-  .name = "imuBinarySem01"
 };
 
 /* Private function prototypes -----------------------------------------------*/
@@ -119,9 +103,9 @@ const osSemaphoreAttr_t imuBinarySem01_attributes = {
 /* USER CODE END FunctionPrototypes */
 
 void All_Init_Run(void *argument);
-extern void IMU_task(void *argument);
 extern void Can_Decode_Task(void *argument);
 extern void Arm_Task(void *argument);
+extern void Mon_Task(void *argument);
 void RC_Task(void *argument);
 
 extern void MX_USB_DEVICE_Init(void);
@@ -142,9 +126,6 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_MUTEX */
 
   /* Create the semaphores(s) */
-  /* creation of imuBinarySem01 */
-  imuBinarySem01Handle = osSemaphoreNew(1, 1, &imuBinarySem01_attributes);
-
   /* USER CODE BEGIN RTOS_SEMAPHORES */
   /* add semaphores, ... */
   /* USER CODE END RTOS_SEMAPHORES */
@@ -155,9 +136,6 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_TIMERS */
 
   /* Create the queue(s) */
-  /* creation of rcQueue */
-  rcQueueHandle = osMessageQueueNew (1, 36, &rcQueue_attributes);
-
   /* creation of canRxQueue */
   canRxQueueHandle = osMessageQueueNew (20, sizeof(CAN_Rx_Message_t), &canRxQueue_attributes);
 
@@ -170,9 +148,6 @@ void MX_FREERTOS_Init(void) {
   /* creation of All_Init */
   All_InitHandle = osThreadNew(All_Init_Run, NULL, &All_Init_attributes);
 
-  /* creation of INSTask */
-  INSTaskHandle = osThreadNew(IMU_task, NULL, &INSTask_attributes);
-
   /* creation of CanDecodeTask */
   CanDecodeTaskHandle = osThreadNew(Can_Decode_Task, NULL, &CanDecodeTask_attributes);
 
@@ -181,6 +156,9 @@ void MX_FREERTOS_Init(void) {
 
   /* creation of ArmTask */
   ArmTaskHandle = osThreadNew(Arm_Task, NULL, &ArmTask_attributes);
+
+  /* creation of MonTask */
+  MonTaskHandle = osThreadNew(Mon_Task, NULL, &MonTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -204,11 +182,6 @@ void All_Init_Run(void *argument)
   /* init code for USB_DEVICE */
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN All_Init_Run */
-	
-	osDelay(100);
-
-	MX_USB_DEVICE_Init();
-	
 	taskENTER_CRITICAL();  //�����ٽ���
 	
 	BSP_FDCAN_Config();

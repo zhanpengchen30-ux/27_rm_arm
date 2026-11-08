@@ -62,12 +62,14 @@ void BSP_FDCAN_Config(void)
     HAL_FDCAN_Start(&hfdcan1);
     HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
 
-    // FDCAN2 is unused. Keep it stopped: an unconnected transceiver can
-    // receive noise and generate needless RX interrupts.
+    // FDCAN2/3 空余。当前布线 7 台全在 CAN1，悬空不接的总线不要启
+    // （收发器噪声会灌进 RX 回调）。拆线到 CAN2 只改两处：这里取消注释
+    // Start/ActivateNotification 两行，再把 dm_motor.c 里 J4~J6/夹爪的
+    // hfdcan 指向 &hfdcan2；下面的 FDCAN2 反馈解析分支已经就绪。
     HAL_FDCAN_ConfigFilter(&hfdcan2, &sFilterConfig);
     HAL_FDCAN_ConfigGlobalFilter(&hfdcan2, FDCAN_REJECT, FDCAN_REJECT, FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE);
 
-    // FDCAN3 is unused; leave it stopped for the same reason.
+    // FDCAN3 仍空余（收纳腿/第二夹爪/调试口），保持停用；扫描时用 BSP_FDCAN_StartAux(3)
     HAL_FDCAN_ConfigFilter(&hfdcan3, &sFilterConfig);
     HAL_FDCAN_ConfigGlobalFilter(&hfdcan3, FDCAN_REJECT, FDCAN_REJECT, FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE);
 }
@@ -118,6 +120,9 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
     {
         if(HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &rx_header, rx_data) == HAL_OK)
         {
+            // 只认 8 字节经典帧：干扰帧/第三方设备帧直接丢，不进队列
+            if(rx_header.DataLength != FDCAN_DLC_BYTES_8) return;
+
             // CAN RX interrupt: push frame into queue
             if(rx_header.IdType == FDCAN_STANDARD_ID)
             {
@@ -176,7 +181,9 @@ void Can_Decode_Task(void const *argument)
             }
             else if(rx_msg.hfdcan->Instance == FDCAN2) 
             {
-
+                // J4/J5/J6/夹爪的反馈。ID 与 CAN1 重复也没关系：
+                // DM_Motor_ParseFeedback 按 (总线, ID) 双条件匹配
+                DM_Motor_ParseFeedback(&hfdcan2, rx_msg.can_id, rx_msg.data);
             }
              else if(rx_msg.hfdcan->Instance == FDCAN3)
             {

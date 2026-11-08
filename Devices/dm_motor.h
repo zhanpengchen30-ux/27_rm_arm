@@ -49,6 +49,7 @@ typedef struct
     // 状态
     uint8_t enabled;        // 是否使能
     uint32_t rx_cnt;        // 接收计数
+    uint32_t last_rx_tick;  // 最近一帧反馈的时间戳，判反馈丢失用
 } DM_Motor_t;
 
 // 初始化所有达妙电机

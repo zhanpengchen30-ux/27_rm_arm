@@ -10,6 +10,7 @@
 
 static uint8_t zigbee_rx_byte;
 Arm_t arm;
+volatile ArmDbg_t g_arm_dbg;   /* Watch 汇总：六轴角度/指令/目标 + 状态位，平铺不折叠 */
 static uint8_t zigbee_buf[32];
 static uint8_t zigbee_idx = 0;
 
@@ -41,7 +42,24 @@ static uint8_t zigbee_idx = 0;
    Use the commanded speed with a floor that still allows holding. */
 #define ARM_VEL_MAX_RAD_S   4.0f
 #define ARM_VEL_MIN_RAD_S   0.4f
-static float arm_prev_cmd[ARM_JOINT_NUM] = {0};
+
+/* 关节 PVT 发帧分频：控制环仍然每 2ms 跑（所有按"拍"计数的判据、限幅、
+   到位保持、示教采样语义都不变），只把发帧降到 1/ARM_TX_DECIMATE。
+   6 轴 500Hz + 1:1 回执 = 6200 帧/s ≈ 80% 负载 → 250Hz 后 3200 帧/s ≈ 42%，
+   回到 CiA 的 50% 建议线内。想恢复原行为只改这一个宏为 1u。
+   同拍只发一半轴（奇偶错峰），突发长度和单帧排队延迟也一起减半。 */
+#define ARM_TX_DECIMATE     2u
+#define ARM_TX_INTERVAL_S   ((float)ARM_TX_DECIMATE * ARM_CTRL_PERIOD_S)
+
+/* 速度字段必须按"真正发帧之间"的位移/时间算：按拍的 cmd_smooth 差值算，
+   分频后会把速度系统性腰斩，电机内环前馈不足表现为跟随发钝。 */
+static float    arm_last_tx_cmd[ARM_JOINT_NUM] = {0};
+static uint32_t arm_last_tx_ms[ARM_JOINT_NUM]  = {0};
+static uint8_t  arm_tx_div = 0;
+
+/* Watch 命令码 3(旧一键循环)的上升沿，一拍只生成一次、只许 Arm_CycleTick 认领。
+   四键流程下 PH10 已改作 STOW(走 action 事件)，命令码 3 只剩 Watch 调试可达。 */
+static uint8_t  arm_cmd3_edge = 0;
 
 /* Jitter diagnostics: per-joint peak-to-peak over a 1s window, 500Hz sampled.
    dbg_tgt_pp  > 0  => the command itself is moving (master noise / link)
@@ -57,6 +75,7 @@ static volatile uint8_t arm_reclutch_req = 0;
 static uint8_t arm_q_offset_mask = 0;
 
 static uint8_t Arm_FbFresh(const DM_Motor_t *m);   /* 定义在后面：反馈 50ms 内有新帧 */
+static void Arm_TakeoverFollow(void);              /* 定义在后面：重新吸合主从偏移 */
 static void Slot_FlashLoad(void);                  /* 矿位点位表，上电从 Flash 扇区6 恢复 */
 
 /* ===== 抽臂 / 取矿（走到预设工作位）========================================
@@ -69,23 +88,52 @@ static void Slot_FlashLoad(void);                  /* 矿位点位表，上电�
  * 老主手只发 0/1，bit1~bit2 恒为 0 ⇒ 行为与改动前完全一致。
  * ======================================================================== */
 
-volatile float g_deploy_pos[ARM_JOINT_NUM] = {   /* 工作位（抽臂） */
+/* 工作位：用户实测姿态（Keil Watch 抄录 dm_motors[0..5].position，单位 rad）。
+   2026-11-13 用户要求 J6 再转 180°（-2.7750 → 0.3665），与放矿点手腕同侧。
+   仍可在现场用 g_deploy_pose_cmd=1 重录覆盖；这里只是出厂默认值。 */
+volatile float   g_deploy_pos[ARM_JOINT_NUM] = {
     -0.0165939f, -0.8249407f, -0.9119177f,
-     0.2397575f, -0.4194326f, -2.7750435f
+     0.2397575f, -0.4194326f,  0.3665491f
 };
-volatile float g_mine_pos[ARM_JOINT_NUM] = {     /* 取矿位 */
-    -0.5640116f, -1.2048903f, -0.6399250f,
-     0.4510946f, -0.9763870f, -2.6010914f
-};
+volatile uint8_t g_deploy_valid    = 1u;  /* 1=工作位已标定且合法 */
+volatile uint8_t g_deploy_pose_cmd = 0u;  /* Watch：1=录当前姿态为工作位 2=清除标定 */
+
 volatile float   g_deploy_speed = 0.5f;   /* rad/s：走 60° 约 2s */
-volatile uint8_t g_deploy_state = 0;      /* 0=跟随 1/3=行走 2=工作位保持 4=取矿位保持(已合爪) */
+volatile uint8_t g_deploy_state = 0;      /* 0=跟随 1=行走 2=工作位保持 */
 volatile uint8_t arm_deploy_cmd = 0;      /* 收到的命令码，Watch 核对用 */
 static   uint8_t arm_deploy_hold = 0;     /* 各关节到位标志 */
+
+/* ===== HOME 归位/接管 + STOW 收纳/展开 ====================================
+   g_home_state 非0 = 暂停跟随主手（自动运动仍运行）。上电默认2(保持)，
+   必须 HOME 走到工作位、再 HOME 重新吸合才恢复跟随，避免上电即跟随乱动。 */
+#define ARM_HOME_FOLLOW    0u
+#define ARM_HOME_GO_WORK   1u
+#define ARM_HOME_HOLD_WORK 2u
+#define ARM_HOME_GO_STOW   3u
+#define ARM_HOME_HOLD_STOW 4u
+
+volatile uint8_t g_home_state = ARM_HOME_HOLD_WORK;
+volatile uint8_t g_home_err   = 0u;
+/* 收纳位：2026-11-09 19:12 现场摆位实测（单位 rad），同样可用 g_stow_pose_cmd 重录 */
+volatile float   g_stow_pos[ARM_JOINT_NUM] = {
+     0.049782753f, -0.134851456f, 0.138284683f,
+     0.0631341934f, -0.33970356f, 0.0936517715f
+};
+volatile uint8_t g_stow_valid = 1u;
+volatile uint8_t g_stow_pose_cmd = 0u;
+
+/* 姿态快照：随手存/走回的一个姿态，与矿位点位表互不影响 */
+volatile float   g_snap_pos[ARM_JOINT_NUM] = {0};
+volatile uint8_t g_snap_valid = 0u;
+volatile uint8_t g_snap_cmd   = 0u;   /* 1=存当前姿态 2=清除 3=走到该姿态 */
+static float    home_goal[ARM_JOINT_NUM];
+static uint8_t  home_hold = 0;
+static uint32_t home_deadline = 0;
 
 /* 命令码 3 = 主手按键发来的 500ms 脉冲：一键循环 工作位→轨迹首点→回放。
    每段到位按电机实际位置进容差并连续保持判定，比按指令位置判更准。 */
 volatile uint8_t g_cycle_state = 0;       /* 0=空闲 1=去工作位 2=去轨迹首点 3=回放中 4=回放完保持 */
-volatile uint8_t g_cycle_err = 0;         /* 1=没录轨迹，按键不生效 */
+volatile uint8_t g_cycle_err = 0;         /* 1=没录轨迹 2=工作位未标定，按键不生效 */
 static   uint8_t cycle_hold = 0;
 static   float   cycle_goal[ARM_JOINT_NUM];
 
@@ -146,16 +194,41 @@ volatile uint32_t zb_gap_max_ms = 0;
 volatile uint32_t zb_reclutch_cnt = 0;
 
 /* ---- 帧格式（与主手 Apps/zigbee.c 严格一致）----------------------------
-   18 字节：AA | q0..q5 (12B) | active | grip | seq | crc8 | 55
-   active: bit0 = deadman，bit1~bit2 = 命令码：0跟随/1工作位/2取矿/3一键循环(按键500ms脉冲)
-           bit3~bit4 保留未用
-   crc8 = CRC-8/ATM(poly 0x07)，覆盖 buf[0..15]
+   19 字节：AB | q0..q5 (12B) | active | action | event_id | seq | crc8 | 55
+   active : bit0=deadman，bit1~2=Watch 调试命令码(0跟随/1工作位/2取矿/3循环)
+   action : 0无事件 1STOW 2ORE 3HOME 4GRIP；event_id 每次按下递增，从手去重
+   crc8 = CRC-8/ATM(poly 0x07)，覆盖 buf[0..16]
    seq 每帧 +1，用于统计无线丢帧（zb_seq_lost）
    长度与各字段下标只在 arm.h 里定义一份，别在这里再写一遍。        */
 volatile uint32_t zb_crc_err  = 0;   /* CRC 校验失败次数 */
 volatile uint32_t zb_seq_lost = 0;   /* 按序号推算出的丢帧数 */
 static uint8_t zigbee_last_seq   = 0;
 static uint8_t zigbee_seq_valid  = 0;
+
+/* 按键事件：ISR 只入队，控制环出队执行（状态机不在中断里跑）。
+   主手把同一事件重复约100ms，从手按 event_id 去重只执行一次；
+   上电/重连后的第一个事件帧只同步序号不执行，避免把断链前的旧按键带进来。 */
+static volatile uint8_t evt_q[4];
+static volatile uint8_t evt_head = 0, evt_tail = 0;
+volatile uint32_t zb_evt_drop = 0;     /* 队列满丢弃的事件数 */
+volatile uint32_t zb_evt_cnt  = 0;     /* 收到并接受的事件总数（排查按键用） */
+static uint8_t evt_last_id = 0;
+static uint8_t evt_swallow = 0;        /* 1=下一个事件帧只同步不执行（仅断线重连时置位） */
+
+static void Arm_EventPush(uint8_t action)
+{
+    uint8_t nh = (uint8_t)((evt_head + 1u) & 3u);
+    if(nh != evt_tail) { evt_q[evt_head] = action; evt_head = nh; zb_evt_cnt++; }
+    else zb_evt_drop++;
+}
+
+static uint8_t Arm_EventPop(void)
+{
+    if(evt_tail == evt_head) return 0u;
+    uint8_t a = evt_q[evt_tail];
+    evt_tail = (uint8_t)((evt_tail + 1u) & 3u);
+    return a;
+}
 
 static uint8_t Zigbee_Crc8(const uint8_t *d, uint8_t n)
 {
@@ -200,8 +273,10 @@ static void Arm_InterpResetAll(void)
     arm_interp_left = 0;
 }
 
+/* 主从方向：-1 表示该轴主手增量取反后再映射到从手。
+   2026-11-09 实测 J6 方向相反，第 6 项由 +1 改为 -1。 */
 static const float ARM_DIR[ARM_JOINT_NUM] = {
-    1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f
+    1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f
 };
 
 static const float ARM_Q_MIN[ARM_JOINT_NUM] = { -3.10f, -2.80f,  -2.40f, -10.0f, -10.0f, -10.0f};
@@ -235,6 +310,10 @@ volatile float g_grip_step  = 0.15f;
 
 /* 夹爪电流限值：同为标幺值，上限 1.0（= 满额定）。 */
 volatile float g_grip_cur = 0.9f;
+
+/* 夹矿确认窗口(rad)：max>min 才生效。未标定时自动夹持确认要求 g_slot_force=1。 */
+volatile float g_grip_ore_min = 0.0f;
+volatile float g_grip_ore_max = 0.0f;
 
 /* 目标相对实测位置的最大超前(rad)。夹住物体后目标走不动，
    钳住误差即钳住夹持力，避免长时间堵转升温。 */
@@ -289,14 +368,12 @@ void Arm_EmergencyStopAndReset(void)
     NVIC_SystemReset();
 }
 
-static void Arm_DecodeFrame(uint8_t active, uint8_t grip, uint8_t seq)
+static void Arm_DecodeFrame(uint8_t active, uint8_t action, uint8_t event_id, uint8_t seq)
 {
     uint32_t now = HAL_GetTick();
     uint8_t deadman = (uint8_t)(active & 0x01u);
     uint8_t long_gap = 0;
     uint8_t reacquire = (deadman && !arm.active);
-
-    arm.gripper_cmd_recv = grip;
     if(arm.recv_cnt > 0)
     {
         uint32_t gap = now - arm.last_rx_tick;
@@ -345,6 +422,17 @@ static void Arm_DecodeFrame(uint8_t active, uint8_t grip, uint8_t seq)
     arm_deploy_cmd = (uint8_t)((active >> 1) & 0x03u);
     arm.connected = 1;
 
+    /* 上电/重连/长断档后的第一个事件帧只同步序号，不执行（拒绝陈旧按键） */
+    /* 只有"断线重连/长断档"才防陈旧按键：那时主手可能还在重复断线前那一下。
+       首次上电没有历史按键可重放，不能吞——否则上电后第一次按键会被吃掉，
+       表现就是"有时候要按两次"。 */
+    if(long_gap) evt_swallow = 1;
+    if(action != 0u && event_id != 0u)
+    {
+        if(evt_swallow) { evt_swallow = 0u; evt_last_id = event_id; }
+        else if(event_id != evt_last_id) { evt_last_id = event_id; Arm_EventPush(action); }
+    }
+
     /* 用序号统计真实丢帧：正常应为 +1 */
     if(zigbee_seq_valid)
     {
@@ -364,7 +452,7 @@ static void Arm_ZigbeeResync(void)
     uint8_t i;
     for(i = 1; i < n; i++)
     {
-        if(zigbee_buf[i] == 0xAA) break;
+        if(zigbee_buf[i] == ZIGBEE_HEAD) break;
     }
     zb_resync++;
     if(i >= n) { zigbee_idx = 0; return; }
@@ -376,25 +464,26 @@ void Arm_Zigbee_ParseByte(uint8_t byte)
 {
     if(zigbee_idx == 0)
     {
-        if(byte == 0xAA) zigbee_buf[zigbee_idx++] = byte;
+        if(byte == ZIGBEE_HEAD) zigbee_buf[zigbee_idx++] = byte;
         return;
     }
     zigbee_buf[zigbee_idx++] = byte;
 
     if(zigbee_idx == ZIGBEE_FRAME_LEN)
     {
-        uint8_t crc_calc = Zigbee_Crc8(zigbee_buf, (uint8_t)(ZIGBEE_FRAME_LEN - 2u)); /* [0..15] */
-        if(zigbee_buf[ZIGBEE_FRAME_LEN - 1u] == 0x55 &&
+        uint8_t crc_calc = Zigbee_Crc8(zigbee_buf, (uint8_t)(ZIGBEE_FRAME_LEN - 2u)); /* [0..16] */
+        if(zigbee_buf[ZIGBEE_FRAME_LEN - 1u] == ZIGBEE_TAIL &&
            crc_calc == zigbee_buf[ZIGBEE_FRAME_LEN - 2u])
         {
             Arm_DecodeFrame(zigbee_buf[ZIGBEE_ACTIVE_OFFSET],
-                            zigbee_buf[ZIGBEE_GRIP_OFFSET],
+                            zigbee_buf[ZIGBEE_ACTION_OFFSET],
+                            zigbee_buf[ZIGBEE_EVENT_OFFSET],
                             zigbee_buf[ZIGBEE_SEQ_OFFSET]);
             zigbee_idx = 0;
         }
         else
         {
-            if(zigbee_buf[ZIGBEE_FRAME_LEN - 1u] != 0x55) zb_bad_tail++;
+            if(zigbee_buf[ZIGBEE_FRAME_LEN - 1u] != ZIGBEE_TAIL) zb_bad_tail++;
             else                                          zb_crc_err++;
             Arm_ZigbeeResync();
         }
@@ -571,7 +660,8 @@ static void Arm_UpdateState(void)
 
     if(arm.state == ARM_STATE_FOLLOWING)
     {
-        if(!arm.q_offset_valid && arm.connected && arm.recv_cnt > 0)
+        if(g_home_state == ARM_HOME_FOLLOW && !arm.q_offset_valid &&
+           arm.connected && arm.recv_cnt > 0)
         {
             (void)Arm_CaptureFollowOffset();
         }
@@ -688,7 +778,8 @@ static uint8_t Arm_TeachStartReturn(uint8_t auto_replay)
 
 static void Arm_TeachHandleRequest(void)
 {
-    uint8_t running = (arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active);
+    uint8_t running = (arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active &&
+                       g_home_state == ARM_HOME_FOLLOW);
     uint8_t motion = (g_teach_state == ARM_TEACH_REPLAY || g_teach_state == ARM_TEACH_DONE || g_teach_state == ARM_TEACH_RETURN);
 
     if(g_cycle_state == 0u && (!running || arm_deploy_cmd != 0u))
@@ -911,13 +1002,18 @@ static void Arm_TeachTickAfterJoints(void)
  * 中止手段 = 再按一下、降档、无线超时。                                  */
 static void Arm_CycleTick(void)
 {
-    static uint8_t cmd3_last = 0;
-    uint8_t cmd3 = (arm_deploy_cmd == 3u) ? 1u : 0u;
-    uint8_t pulse = (cmd3 && !cmd3_last);
-    cmd3_last = cmd3;
+    uint8_t pulse = arm_cmd3_edge;
 
-    /* 空闲时按键归矿位流程；已经有循环在跑就让它把这一段收尾，别半路撒手 */
-    if(g_slot_enable && g_cycle_state == 0u && pulse) return;
+    /* 四键流程占用臂(非跟随态)时，旧的一键循环(Watch cmd3)不介入 */
+    if(g_home_state != ARM_HOME_FOLLOW)
+    {
+        if(g_cycle_state != 0u)
+        {
+            if(g_cycle_state == 3u) Arm_TeachStopReplay();
+            g_cycle_state = 0u;
+        }
+        return;
+    }
 
     if(g_cycle_state != 0u &&
        (arm.state != ARM_STATE_FOLLOWING || !arm.connected ||
@@ -931,6 +1027,7 @@ static void Arm_CycleTick(void)
 
     if(pulse)
     {
+        arm_cmd3_edge = 0u;      /* 本次脉冲已被循环认领(交还/报错/启动都一样) */
         if(g_cycle_state != 0u)                 /* 循环中再按 = 交还跟随 */
         {
             if(g_cycle_state == 3u) Arm_TeachStopReplay();
@@ -941,6 +1038,11 @@ static void Arm_CycleTick(void)
         if(g_teach_count < 2u)                  /* 没录轨迹：只报错不动作 */
         {
             g_cycle_err = 1u;
+            return;
+        }
+        if(!g_deploy_valid)                     /* 工作位没标定：不知道往哪走 */
+        {
+            g_cycle_err = 2u;
             return;
         }
         g_cycle_err = 0u;
@@ -1135,15 +1237,17 @@ static void Teach_FlashLoad(void)
 
 /* ===== 单臂两矿位：点位映射 + 顺序执行 + 异常处理 ==========================
  * 本臂负责矿位 g_slot_base 和 g_slot_base+1（臂A=1,2；臂B=3,4）。
- * 顺序固定、取放互为逆序（车上后放的先取，LIFO）：
- *   放矿 槽0→槽1  =  臂A 先放1再放2 / 臂B 先放3再放4（"34"）
- *   取矿 槽1→槽0  =  臂A 先取2再取1（"21"）/ 臂B 先取4再取3
+ * 顺序固定，四步一轮（step 0..3，目标槽由 Arm_SlotStepTarget 给出）：
+ *   放矿 槽1→槽0  =  臂A 矿位2→矿位1（"21"）/ 臂B 矿位4→矿位3（"43"）
+ *   取矿 槽0→槽1  =  臂A 矿位1→矿位2（"12"）/ 臂B 矿位3→矿位4（"34"）
+ * 顺序只由下面那张 4 元素表决定，想改顺序改那一行即可，别在别处写死。
  *
  * 一次完整作业 = 手动取、自动放：
  *   g_slot_cmd=2（或主手按键）：自动走到"该取的矿位"的取矿点，到位立刻交还跟随，
  *     操作手手动微调对矿并按夹爪键合爪；
- *   g_slot_cmd=1（主手按键上升沿）：回工作位 → 走到该矿位的放矿点 → 张爪卸矿并保持
- *     ARM_SLOT_OPEN_MS → 回工作位 → 交还跟随。
+ *   g_slot_cmd=1（主手按键上升沿）：从当前位置直接出发（不回工作位，操作手夹着矿
+ *     随时按），该槽录了"放矿点上方"就先到上方过渡点再下探放矿点，没录就直插放矿点；
+ *     到放矿点后张爪卸矿并保持 ARM_SLOT_OPEN_MS → 回工作位 → 交还跟随。
  * 点位存的是 6 台电机的绝对角（与 g_deploy_pos 同一套约定），不看主手角度、
  * 不走主从偏移，所以录一次就能反复走到同一个姿态。
  * 每步到位判据 = 实测位置进容差 + 连续保持 + 反馈新鲜；任一关节反馈丢失或
@@ -1157,11 +1261,17 @@ static void Teach_FlashLoad(void)
 #define ARM_SLOT_SETTLE_TOL   0.02f     /* 录点位时实测与指令的最大差(臂必须静止) */
 
 #define ARM_SLOT_ST_IDLE      0u
-#define ARM_SLOT_ST_GO_WORK   1u        /* 先把矿带回标准交接位 */
+#define ARM_SLOT_ST_GO_WORK   1u        /* 先回到工作位 */
 #define ARM_SLOT_ST_GO_PLACE  2u        /* 走向放矿点 */
 #define ARM_SLOT_ST_OPEN      3u        /* 张爪卸矿 + 保持 */
-#define ARM_SLOT_ST_BACK      4u        /* 回标准交接位 */
-#define ARM_SLOT_ST_GO_TAKE   5u        /* 走向取矿点，到位交还手动 */
+#define ARM_SLOT_ST_BACK      4u        /* 回工作位 */
+#define ARM_SLOT_ST_GO_TAKE   5u        /* 走向取矿点（张爪接近） */
+#define ARM_SLOT_ST_CLOSE     6u        /* 合爪 + 夹稳确认 */
+#define ARM_SLOT_ST_OPEN_FIRST 7u       /* 取矿出发前：先等夹爪真张开 */
+#define ARM_SLOT_ST_GO_PLACE_ABOVE 8u   /* 先到放矿点上方过渡点，再下探放矿点 */
+#define ARM_SLOT_ST_GO_TAKE_ABOVE  9u   /* 取矿去程：先到取矿点上方过渡点，再下探取矿点 */
+#define ARM_SLOT_ST_GO_TAKE_LIFT   10u  /* 合爪夹住后：先抬到"矿在夹爪里"点位 */
+#define ARM_SLOT_ST_GO_TAKE_ABOVE_RET 11u /* 取矿回程：抬出后再经上方过渡点回工作位 */
 
 #define ARM_SLOT_ERR_NONE      0u
 #define ARM_SLOT_ERR_MODE      1u       /* 不在上档 / 主手掉线 / 被别的自动命令打断 */
@@ -1171,29 +1281,79 @@ static void Teach_FlashLoad(void)
 #define ARM_SLOT_ERR_FEEDBACK  5u       /* 反馈不新鲜：拒绝启动，行走中则中止 */
 #define ARM_SLOT_ERR_TIMEOUT   6u       /* 单步超时：被卡住、被矿顶住、走不到位 */
 #define ARM_SLOT_ERR_SETTLE    7u       /* 录点位时臂还在动 */
+#define ARM_SLOT_ERR_GRIP      8u       /* 夹持未确认：窗口未标定且非force，或合爪后没夹到矿 */
 
 volatile uint8_t g_slot_enable   = 1u;   /* 0=本层不介入 */
 volatile uint8_t g_slot_base     = 1u;   /* 1=本臂管矿位1,2  3=本臂管矿位3,4 */
-volatile uint8_t g_slot_cmd      = 0u;   /* 1=自动放矿 2=走到下一取矿点 3=中止 */
+volatile uint8_t g_slot_cmd      = 0u;   /* Watch：1=放矿 2=取矿 3=中止 */
 volatile uint8_t g_slot_state    = ARM_SLOT_ST_IDLE;
 volatile uint8_t g_slot_err      = ARM_SLOT_ERR_NONE;
 volatile uint8_t g_slot_target   = 0u;   /* 本流程针对的槽下标，矿位号 = base + target */
+volatile uint8_t g_slot_step     = 0u;   /* 0放槽1 1放槽0 2取槽0 3取槽1 */
 volatile uint8_t g_slot_occupied[ARM_SLOT_NUM] = {0u, 0u};
-volatile int8_t  g_slot_place_ptr = 0;   /* 放矿指针 0→1 */
-volatile int8_t  g_slot_take_ptr  = 1;   /* 取矿指针 1→0（后放先取） */
-volatile int8_t  g_slot_carry     = -1;  /* 手上这颗矿来自哪个槽，-1=不知道(纯手动夹的) */
-volatile uint8_t g_slot_force     = 0u;  /* 1=忽略库存冲突（人工确认过再用） */
-volatile uint8_t g_slot_pose_cmd  = 0u;  /* 1=录取矿点 2=录放矿点 3=清除本槽 */
+volatile int8_t  g_slot_carry     = -1;  /* 手上这颗矿来自哪个槽，-1=手动夹的/不知道 */
+volatile uint8_t g_slot_force     = 0u;  /* 1=人工override：忽略库存冲突+未标定夹持窗口时信任操作手 */
+volatile uint8_t g_slot_pose_cmd  = 0u;  /* 1=录取矿点 2=录放矿点 3=清除本槽 4=录放矿点上方 5=录取矿点上方 6=录抬出点 */
 volatile uint8_t g_slot_pose_sel  = 0u;  /* 录入/清除的槽下标 */
 volatile uint8_t g_slot_saved     = 0u;  /* Flash 里有点位表 */
 volatile uint8_t g_slot_save_req  = 0u;  /* 1=存Flash 2=删除；仅下档生效 */
 volatile uint8_t g_slot_save_err  = 0u;  /* 0=ok 1=不在下档 2=Flash失败 4=加载校验不过 */
 
-Arm_SlotPose_t arm_slot[ARM_SLOT_NUM];
+/* 出厂默认：取矿点/上方点/抬出点均来自用户实测（2026-11-14 Watch 抄录 g_arm_dbg.q1~q6，rad），
+   两个槽写同一个矿位（只取一个矿，step2/3 都指它）。
+   槽1(下标1)的放矿点与放矿点上方为 2026-11-12 实测，保留备用；存过 Flash 后以 Flash 为准。 */
+Arm_SlotPose_t arm_slot[ARM_SLOT_NUM] = {
+    { { -0.777256012f, -1.1854353f,  -0.689517021f,
+         0.261882782f,  0.207331657f, -0.455672264f },    /* take：夹爪伸进矿里的姿态（11-14 新版，不挨边） */
+      { -0.776493073f, -1.10418129f, -0.831044197f,
+         0.313382149f,  0.467497826f, -0.518615723f },    /* take_above：取矿点上方过渡点 */
+      { -0.807774544f, -1.20450878f, -0.708971977f,
+         0.230220795f,  0.26455307f,  -0.557145119f },    /* take_lift：矿在夹爪里的抬出点 */
+      {0}, {0},
+      1u, 1u, 1u, 0u, 0u },
+    { { -0.777256012f, -1.1854353f,  -0.689517021f,
+         0.261882782f,  0.207331657f, -0.455672264f },    /* take：同一个矿位 */
+      { -0.776493073f, -1.10418129f, -0.831044197f,
+         0.313382149f,  0.467497826f, -0.518615723f },    /* take_above：同上 */
+      { -0.807774544f, -1.20450878f, -0.708971977f,
+         0.230220795f,  0.26455307f,  -0.557145119f },    /* take_lift：同上 */
+      { -0.614366531f, -1.23350143f, -0.350004196f,
+         0.690279961f,  0.354200363f, -0.118066788f },   /* place：矿放进去的姿态 */
+      { -0.605592728f, -1.014534f,   -0.466734886f,
+         0.863088608f,  0.429732323f,  0.0612268448f },  /* place_above：放矿点正上方 */
+      1u, 1u, 1u, 1u, 1u }  /* take/take_above/take_lift/place/above 有效性 */
+};
 static float    slot_goal[ARM_JOINT_NUM];
 static uint8_t  slot_hold = 0;
+static uint8_t  slot_is_take = 0;       /* 本趟是取矿(1)还是放矿(0)，决定 GO_WORK 后接哪段 */
 static uint32_t slot_step_deadline = 0;
 static uint32_t slot_dwell_until = 0;
+
+/* step → 槽下标：比赛顺序 放槽1 → 放槽0 → 取槽0 → 取槽1（矿位号 = base + 下标）。
+   2026-11-11 用户确认的顺序；一轮做完 step 自动回 0。 */
+static uint8_t Arm_SlotStepTarget(uint8_t step)
+{
+    static const uint8_t map[4] = {1u, 0u, 0u, 1u};
+    return map[step & 3u];
+}
+
+static uint8_t Arm_GripWindowValid(void)
+{
+    return (g_grip_ore_max > g_grip_ore_min) ? 1u : 0u;
+}
+
+/* 夹爪是否夹稳了矿：反馈新鲜+无错+静止+目标已追上，且位置落在夹矿窗口内。
+   窗口未标定时只有 g_slot_force=1 才信任（否则返回0，自动流程报 err=8）。 */
+static uint8_t Arm_GripHoldingOre(void)
+{
+    DM_Motor_t *gm = DM_Motor_Get(ARM_JOINT_NUM);
+    if(gm == NULL || !Arm_FbFresh(gm) || gm->error != 1u) return 0u;
+    if(fabsf(gm->velocity) > 0.08f) return 0u;
+    if(fabsf(arm.target_gripper - gm->position) > (GRIP_MAX_LAG + 0.03f)) return 0u;
+    if(Arm_GripWindowValid())
+        return (gm->position >= g_grip_ore_min && gm->position <= g_grip_ore_max) ? 1u : 0u;
+    return g_slot_force ? 1u : 0u;
+}
 
 static uint8_t Arm_SlotPoseOk(const volatile float *p)
 {
@@ -1246,13 +1406,32 @@ static void Arm_SlotGoalSet(const volatile float *pose)
     slot_hold = 0;
 }
 
-/* 交还控制权：以当前位置重新吸合，主手不会感觉到跳变 */
+/* 结束/中止矿位流程：原地保持（夹爪维持当前期望），暂停跟随，等 HOME 接管。
+   不再自动重新吸合跟随——自动流程结束后臂可能正夹着矿，直接跟随主手会甩矿。 */
 static void Arm_SlotStop(uint8_t err)
 {
     g_slot_state = ARM_SLOT_ST_IDLE;
     slot_hold = 0;
     g_slot_err = err;
-    arm_reclutch_req = 1;
+    g_home_state = ARM_HOME_HOLD_WORK;
+}
+
+/* 一趟矿位动作正常做完：回到工作位后自动交还跟随，不用再按 HOME。
+   手上还夹着矿时默认也交还 —— 比赛里控制源是自定义控制器，操作手不动臂就不动，
+   不会甩矿；只有控制源是主手零力模式时才需要担心漂移，那种场合把
+   g_slot_auto_follow 写 0 退回旧行为（夹着矿保持住等操作手处理）。 */
+volatile uint8_t g_slot_auto_follow = 1u;
+
+static void Arm_SlotFinish(void)
+{
+    g_slot_state = ARM_SLOT_ST_IDLE;
+    slot_hold = 0;
+    g_slot_err = ARM_SLOT_ERR_NONE;
+    if((g_slot_carry < 0 || g_slot_auto_follow) &&
+       arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active)
+        Arm_TakeoverFollow();
+    else
+        g_home_state = ARM_HOME_HOLD_WORK;
 }
 
 /* 0=还在走 1=已到位并保持 2=单步超时 */
@@ -1274,6 +1453,7 @@ static uint8_t Arm_SlotArrived(void)
 
 static uint8_t Arm_SlotAtWorkPose(void)
 {
+    if(!g_deploy_valid) return 0u;   /* 未标定工作位：一律按"不在交接位"处理 */
     for(int i = 0; i < ARM_JOINT_NUM; i++)
     {
         DM_Motor_t *m = DM_Motor_Get(i);
@@ -1326,46 +1506,50 @@ static void Arm_SlotPoseHandler(void)
         if(e != ARM_SLOT_ERR_NONE) { g_slot_err = e; return; }
         arm_slot[s].place_valid = 1u;
     }
+    else if(cmd == 4u)
+    {
+        uint8_t e = Arm_SlotCapture(arm_slot[s].place_above);
+        if(e != ARM_SLOT_ERR_NONE) { g_slot_err = e; return; }
+        arm_slot[s].above_valid = 1u;
+    }
+    else if(cmd == 5u)
+    {
+        uint8_t e = Arm_SlotCapture(arm_slot[s].take_above);
+        if(e != ARM_SLOT_ERR_NONE) { g_slot_err = e; return; }
+        arm_slot[s].take_above_valid = 1u;
+    }
+    else if(cmd == 6u)
+    {
+        uint8_t e = Arm_SlotCapture(arm_slot[s].take_lift);
+        if(e != ARM_SLOT_ERR_NONE) { g_slot_err = e; return; }
+        arm_slot[s].take_lift_valid = 1u;
+    }
     else if(cmd == 3u)
     {
         arm_slot[s].take_valid = 0u;
+        arm_slot[s].take_above_valid = 0u;
+        arm_slot[s].take_lift_valid = 0u;
         arm_slot[s].place_valid = 0u;
+        arm_slot[s].above_valid = 0u;
         g_slot_occupied[s] = 0u;
     }
 }
 
-/* 一轮 = 放满两个位、再按逆序取空。两头都走完才允许开新一轮；
-   一半一半说明流程被打断过，必须人工确认（Watch 改指针或 g_slot_force=1）。 */
-static uint8_t Arm_SlotRoundReady(void)
-{
-    if(g_slot_place_ptr < (int8_t)ARM_SLOT_NUM && g_slot_take_ptr >= 0) return 1u;
-    if(g_slot_place_ptr >= (int8_t)ARM_SLOT_NUM && g_slot_take_ptr < 0)
-    {
-        g_slot_place_ptr = 0;
-        g_slot_take_ptr = (int8_t)ARM_SLOT_NUM - 1;
-        return 1u;
-    }
-    return 0u;
-}
-
+/* 放矿：当前 step 必须是放矿步(0/1)，目标槽有空位，且手上确实夹着矿。
+   夹持确认靠夹矿窗口（或 force），空爪/未标定一律拒绝，不拿空爪去放矿。 */
 static void Arm_SlotStartPlace(void)
 {
-    if(!Arm_SlotRoundReady())
+    if(g_slot_step >= 2u)
     {
-        g_slot_err = ARM_SLOT_ERR_SEQ;         /* 放取指针不同步，先人工核对 */
+        g_slot_err = ARM_SLOT_ERR_SEQ;         /* 放矿步已走完，当前该取矿 */
         return;
     }
-    if(g_slot_place_ptr >= (int8_t)ARM_SLOT_NUM)
+    if(!g_deploy_valid || !Arm_SlotPoseOk(g_deploy_pos))
     {
-        g_slot_err = ARM_SLOT_ERR_SEQ;         /* 两个位都放过了，该去取矿 */
+        g_slot_err = ARM_SLOT_ERR_POSE;
         return;
     }
-    if(!Arm_SlotPoseOk(g_deploy_pos))
-    {
-        g_slot_err = ARM_SLOT_ERR_POSE;        /* 工作位本身非法，回不去就没意义 */
-        return;
-    }
-    uint8_t s = (uint8_t)g_slot_place_ptr;
+    uint8_t s = Arm_SlotStepTarget(g_slot_step);
     if(!arm_slot[s].place_valid || !Arm_SlotPoseOk(arm_slot[s].place))
     {
         g_slot_err = ARM_SLOT_ERR_POSE;        /* 这个矿位的放矿点还没录 */
@@ -1373,36 +1557,45 @@ static void Arm_SlotStartPlace(void)
     }
     if(!g_slot_force && g_slot_occupied[s])
     {
-        g_slot_err = ARM_SLOT_ERR_SEQ;         /* 该位已有矿：先取走，或纠正库存 */
+        g_slot_err = ARM_SLOT_ERR_SEQ;         /* 该位已有矿 */
         return;
     }
+    if(!arm.gripper_cmd_recv || !Arm_GripHoldingOre())
+    {
+        g_slot_err = ARM_SLOT_ERR_GRIP;        /* 没夹住矿（或窗口未标定且非force） */
+        return;
+    }
+    slot_is_take = 0u;
     g_slot_target = s;
     g_slot_err = ARM_SLOT_ERR_NONE;
-    if(Arm_SlotAtWorkPose())
+    /* 不回工作位：夹着矿按一下就该直奔放矿点。录了上方过渡点就先到上方
+       再下探，没录（或点位非法）就直插放矿点。 */
+    if(arm_slot[s].above_valid && Arm_SlotPoseOk(arm_slot[s].place_above))
+    {
+        Arm_SlotGoalSet(arm_slot[s].place_above);
+        g_slot_state = ARM_SLOT_ST_GO_PLACE_ABOVE;
+    }
+    else
     {
         Arm_SlotGoalSet(arm_slot[s].place);
         g_slot_state = ARM_SLOT_ST_GO_PLACE;
     }
-    else
-    {
-        Arm_SlotGoalSet(g_deploy_pos);
-        g_slot_state = ARM_SLOT_ST_GO_WORK;
-    }
 }
 
+/* 取矿：当前 step 必须是取矿步(2/3)，目标槽库存有矿。张爪接近，到位后再合爪确认。 */
 static void Arm_SlotStartTake(void)
 {
-    if(!Arm_SlotRoundReady())
+    if(g_slot_step < 2u)
     {
-        g_slot_err = ARM_SLOT_ERR_SEQ;
+        g_slot_err = ARM_SLOT_ERR_SEQ;         /* 还没放满，当前该放矿 */
         return;
     }
-    if(g_slot_take_ptr < 0)
+    if(!g_deploy_valid || !Arm_SlotPoseOk(g_deploy_pos))
     {
-        g_slot_err = ARM_SLOT_ERR_SEQ;         /* 该取的两个位都取空了 */
+        g_slot_err = ARM_SLOT_ERR_POSE;
         return;
     }
-    uint8_t s = (uint8_t)g_slot_take_ptr;
+    uint8_t s = Arm_SlotStepTarget(g_slot_step);
     if(!arm_slot[s].take_valid || !Arm_SlotPoseOk(arm_slot[s].take))
     {
         g_slot_err = ARM_SLOT_ERR_POSE;        /* 这个矿位的取矿点还没录 */
@@ -1413,21 +1606,33 @@ static void Arm_SlotStartTake(void)
         g_slot_err = ARM_SLOT_ERR_SEQ;         /* 库存显示这个位是空的 */
         return;
     }
+    /* 手上已经有矿就不许去取：出发前要张爪，张爪就把矿掉在工作位了 */
+    if(g_slot_carry >= 0 || (Arm_GripWindowValid() && Arm_GripHoldingOre()))
+    {
+        g_slot_err = ARM_SLOT_ERR_SEQ;
+        return;
+    }
+    slot_is_take = 1u;
     g_slot_target = s;
     g_slot_err = ARM_SLOT_ERR_NONE;
-    Arm_SlotGoalSet(arm_slot[s].take);
-    g_slot_state = ARM_SLOT_ST_GO_TAKE;
+    arm.gripper_cmd_recv = 0u;                 /* 出发前先张爪 */
+    /* 出发前爪必须真张开：闭着爪走过去会顶到矿位/矿，先等张开到位再起步 */
+    slot_step_deadline = HAL_GetTick() + 1500u;
+    g_slot_state = ARM_SLOT_ST_OPEN_FIRST;
 }
 
-/* 控制环每拍调用一次，放在 Arm_CycleTick 之后，和它们用同一套到位判据 */
+/* 控制环每拍调用一次。ORE 按键经 Arm_ButtonTick 直接调 StartPlace/StartTake；
+   这里只推进状态机和处理 Watch 的 g_slot_cmd。流程中再按 ORE 不排队不跳步。 */
 static void Arm_SlotTick(void)
 {
-    static uint8_t btn_last = 0;
     uint32_t now = HAL_GetTick();
+
+    /* 录点位不受 g_slot_enable 影响：流程关掉也要能标定，否则改不了点位 */
+    Arm_SlotPoseHandler();
 
     if(!g_slot_enable) return;
 
-    /* 控制权被拿走或链路断：立即中止，不推进指针、不改库存 */
+    /* 控制权被拿走或链路断：立即中止保持，不推进 step、不改库存 */
     if(g_slot_state != ARM_SLOT_ST_IDLE &&
        (arm.state != ARM_STATE_FOLLOWING || !arm.connected || Arm_SlotBusy()))
     {
@@ -1435,26 +1640,17 @@ static void Arm_SlotTick(void)
         return;
     }
 
-    Arm_SlotPoseHandler();
-
-    /* 主手按键(PH10)发来的命令码 3 上升沿 = 放矿流程开关；Watch 写 g_slot_cmd 同义 */
-    uint8_t btn = (arm_deploy_cmd == 3u) ? 1u : 0u;
-    uint8_t pulse = (btn && !btn_last);
-    btn_last = btn;
-
     uint8_t cmd = g_slot_cmd;
-    if(cmd == 0u && pulse) cmd = 1u;
-
     if(cmd != 0u)
     {
         g_slot_cmd = 0u;
-        g_slot_err = ARM_SLOT_ERR_NONE;
-
-        if(g_slot_state != ARM_SLOT_ST_IDLE)
+        if(cmd == 3u)                          /* 中止：原地保持 */
         {
-            Arm_SlotStop(ARM_SLOT_ERR_NONE);   /* 流程中再按 = 停住交还，矿不丢 */
+            if(g_slot_state != ARM_SLOT_ST_IDLE) Arm_SlotStop(ARM_SLOT_ERR_NONE);
             return;
         }
+        if(g_slot_state != ARM_SLOT_ST_IDLE) return;   /* 忙：忽略，不跳步 */
+        g_slot_err = ARM_SLOT_ERR_NONE;
         if(arm.state != ARM_STATE_FOLLOWING || !arm.connected)
         {
             g_slot_err = ARM_SLOT_ERR_MODE;
@@ -1462,16 +1658,14 @@ static void Arm_SlotTick(void)
         }
         if(Arm_SlotBusy())    { g_slot_err = ARM_SLOT_ERR_BUSY;     return; }
         if(!Arm_SlotFbOk())   { g_slot_err = ARM_SLOT_ERR_FEEDBACK; return; }
-
         if(cmd == 1u)      Arm_SlotStartPlace();
         else if(cmd == 2u) Arm_SlotStartTake();
+        if(g_slot_state != ARM_SLOT_ST_IDLE) g_home_state = ARM_HOME_HOLD_WORK;
         return;
     }
 
-    /* 行走段反馈丢了不再靠超时兜底，直接中止并报错 */
-    if((g_slot_state == ARM_SLOT_ST_GO_WORK || g_slot_state == ARM_SLOT_ST_GO_PLACE ||
-        g_slot_state == ARM_SLOT_ST_BACK || g_slot_state == ARM_SLOT_ST_GO_TAKE) &&
-       !Arm_SlotFbOk())
+    /* 任何非空闲段反馈丢了直接中止保持，不靠超时兜底 */
+    if(g_slot_state != ARM_SLOT_ST_IDLE && !Arm_SlotFbOk())
     {
         Arm_SlotStop(ARM_SLOT_ERR_FEEDBACK);
         return;
@@ -1484,7 +1678,24 @@ static void Arm_SlotTick(void)
         uint8_t r = Arm_SlotArrived();
         if(r == 2u) { Arm_SlotStop(ARM_SLOT_ERR_TIMEOUT); return; }
         if(r != 1u) return;
-        Arm_SlotGoalSet(arm_slot[g_slot_target].place);
+        if(slot_is_take)
+        {
+            Arm_SlotGoalSet(arm_slot[g_slot_target].take);
+            g_slot_state = ARM_SLOT_ST_GO_TAKE;
+        }
+        else
+        {
+            Arm_SlotGoalSet(arm_slot[g_slot_target].place);
+            g_slot_state = ARM_SLOT_ST_GO_PLACE;
+        }
+        return;
+    }
+    case ARM_SLOT_ST_GO_PLACE_ABOVE:
+    {
+        uint8_t r = Arm_SlotArrived();
+        if(r == 2u) { Arm_SlotStop(ARM_SLOT_ERR_TIMEOUT); return; }
+        if(r != 1u) return;
+        Arm_SlotGoalSet(arm_slot[g_slot_target].place);   /* 到上方点后下探放矿点 */
         g_slot_state = ARM_SLOT_ST_GO_PLACE;
         return;
     }
@@ -1493,27 +1704,56 @@ static void Arm_SlotTick(void)
         uint8_t r = Arm_SlotArrived();
         if(r == 2u) { Arm_SlotStop(ARM_SLOT_ERR_TIMEOUT); return; }
         if(r != 1u) return;
+        arm.gripper_cmd_recv = 0u;             /* 到位才张爪卸矿 */
         slot_dwell_until = now + ARM_SLOT_OPEN_MS;
         g_slot_state = ARM_SLOT_ST_OPEN;
         return;
     }
     case ARM_SLOT_ST_OPEN:
+    {
         if((int32_t)(now - slot_dwell_until) < 0) return;
+        DM_Motor_t *gm = DM_Motor_Get(ARM_JOINT_NUM);
+        /* 必须真的张开（到位且反馈新鲜）才算卸矿成功，否则中止 */
+        if(gm == NULL || !Arm_FbFresh(gm) ||
+           fabsf(gm->position - g_grip_open) > 0.15f) return;
         g_slot_occupied[g_slot_target] = 1u;
-        if(g_slot_carry >= 0 && (uint8_t)g_slot_carry < ARM_SLOT_NUM)
-            g_slot_occupied[g_slot_carry] = 0u;    /* 这颗矿的来源位空出来了 */
         g_slot_carry = -1;
-        g_slot_place_ptr = (int8_t)(g_slot_place_ptr + 1);
+        g_slot_step = (uint8_t)((g_slot_step + 1u) & 3u);
         Arm_SlotGoalSet(g_deploy_pos);
         g_slot_state = ARM_SLOT_ST_BACK;
         return;
-
-    case ARM_SLOT_ST_BACK:
+    }
+    case ARM_SLOT_ST_OPEN_FIRST:
+    {
+        DM_Motor_t *gm = DM_Motor_Get(ARM_JOINT_NUM);
+        if(gm == NULL || !Arm_FbFresh(gm)) { Arm_SlotStop(ARM_SLOT_ERR_FEEDBACK); return; }
+        if(fabsf(gm->position - g_grip_open) > 0.15f)
+        {
+            /* 还没张开：原地等，超时就中止，绝不闭着爪出发 */
+            if((int32_t)(now - slot_step_deadline) >= 0) Arm_SlotStop(ARM_SLOT_ERR_GRIP);
+            return;
+        }
+        /* 不回工作位：张爪确认后直接奔取矿点。录了取矿上方点就先到上方再下探，
+           没录（或点位非法）就直插取矿点。 */
+        if(arm_slot[g_slot_target].take_above_valid && Arm_SlotPoseOk(arm_slot[g_slot_target].take_above))
+        {
+            Arm_SlotGoalSet(arm_slot[g_slot_target].take_above);
+            g_slot_state = ARM_SLOT_ST_GO_TAKE_ABOVE;
+        }
+        else
+        {
+            Arm_SlotGoalSet(arm_slot[g_slot_target].take);
+            g_slot_state = ARM_SLOT_ST_GO_TAKE;
+        }
+        return;
+    }
+    case ARM_SLOT_ST_GO_TAKE_ABOVE:
     {
         uint8_t r = Arm_SlotArrived();
         if(r == 2u) { Arm_SlotStop(ARM_SLOT_ERR_TIMEOUT); return; }
         if(r != 1u) return;
-        Arm_SlotStop(ARM_SLOT_ERR_NONE);           /* 一整趟放矿完成 */
+        Arm_SlotGoalSet(arm_slot[g_slot_target].take);   /* 到上方点后下探取矿点 */
+        g_slot_state = ARM_SLOT_ST_GO_TAKE;
         return;
     }
     case ARM_SLOT_ST_GO_TAKE:
@@ -1521,10 +1761,71 @@ static void Arm_SlotTick(void)
         uint8_t r = Arm_SlotArrived();
         if(r == 2u) { Arm_SlotStop(ARM_SLOT_ERR_TIMEOUT); return; }
         if(r != 1u) return;
-        /* 到位即交还：微调对矿和合爪是手动的，合完再按按键走放矿流程 */
+        arm.gripper_cmd_recv = 1u;             /* 到位才合爪 */
+        slot_hold = 0;
+        slot_step_deadline = now + 3000u;      /* 3s 内必须夹稳确认 */
+        g_slot_state = ARM_SLOT_ST_CLOSE;
+        return;
+    }
+    case ARM_SLOT_ST_CLOSE:
+    {
+        if((int32_t)(now - slot_step_deadline) >= 0)
+        {
+            Arm_SlotStop(ARM_SLOT_ERR_GRIP);   /* 没夹到矿：保持在本位，人工处理 */
+            return;
+        }
+        if(Arm_GripHoldingOre()) slot_hold++;
+        else slot_hold = 0;
+        if(slot_hold < ARM_SLOT_HOLD_TICKS) return;
+        g_slot_occupied[g_slot_target] = 0u;
         g_slot_carry = (int8_t)g_slot_target;
-        g_slot_take_ptr = (int8_t)(g_slot_take_ptr - 1);
-        Arm_SlotStop(ARM_SLOT_ERR_NONE);
+        g_slot_step = (uint8_t)((g_slot_step + 1u) & 3u);
+        /* 夹稳后先抬到"矿在夹爪里"点位，把矿提出矿位，再回工作位 */
+        if(arm_slot[g_slot_target].take_lift_valid && Arm_SlotPoseOk(arm_slot[g_slot_target].take_lift))
+        {
+            Arm_SlotGoalSet(arm_slot[g_slot_target].take_lift);
+            g_slot_state = ARM_SLOT_ST_GO_TAKE_LIFT;
+        }
+        else
+        {
+            Arm_SlotGoalSet(g_deploy_pos);
+            g_slot_state = ARM_SLOT_ST_BACK;
+        }
+        return;
+    }
+    case ARM_SLOT_ST_GO_TAKE_LIFT:
+    {
+        uint8_t r = Arm_SlotArrived();
+        if(r == 2u) { Arm_SlotStop(ARM_SLOT_ERR_TIMEOUT); return; }
+        if(r != 1u) return;
+        /* 回程也经取矿上方过渡点（来回都走），没录就直接回工作位 */
+        if(arm_slot[g_slot_target].take_above_valid && Arm_SlotPoseOk(arm_slot[g_slot_target].take_above))
+        {
+            Arm_SlotGoalSet(arm_slot[g_slot_target].take_above);
+            g_slot_state = ARM_SLOT_ST_GO_TAKE_ABOVE_RET;
+        }
+        else
+        {
+            Arm_SlotGoalSet(g_deploy_pos);
+            g_slot_state = ARM_SLOT_ST_BACK;
+        }
+        return;
+    }
+    case ARM_SLOT_ST_GO_TAKE_ABOVE_RET:
+    {
+        uint8_t r = Arm_SlotArrived();
+        if(r == 2u) { Arm_SlotStop(ARM_SLOT_ERR_TIMEOUT); return; }
+        if(r != 1u) return;
+        Arm_SlotGoalSet(g_deploy_pos);
+        g_slot_state = ARM_SLOT_ST_BACK;       /* 夹着矿回工作位 */
+        return;
+    }
+    case ARM_SLOT_ST_BACK:
+    {
+        uint8_t r = Arm_SlotArrived();
+        if(r == 2u) { Arm_SlotStop(ARM_SLOT_ERR_TIMEOUT); return; }
+        if(r != 1u) return;
+        Arm_SlotFinish();                      /* 一趟完成：回工作位并自动交还跟随 */
         return;
     }
     default:
@@ -1532,17 +1833,28 @@ static void Arm_SlotTick(void)
     }
 }
 
-/* ===== 矿位点位表掉电保存（Flash 扇区 6，与轨迹扇区 7 分开擦除）===========
- * 布局：32B 头(magic/槽数/crc/本臂矿位号/三个指针) + 2×56B 记录，补到 128B。
- * 头最后写：中途断电整份作废，不会留下半截点位。
- * 擦+写有全片取指停顿，所以只允许下档(电机已失能)时操作。                  */
+/* ===== 矿位点位表 + 工作位/收纳位掉电保存（Flash 扇区 6，与轨迹扇区 7 分开）====
+ * SLT6 布局：32B 头(magic/槽数/crc/base/stow_valid) + 332B 载荷。
+ * 载荷：2×128B 记录(take24+take_above24+take_lift24+place24+place_above24
+ *       +valid5+pad3)=256
+ *       + 收纳位24 + stow_valid1 + base1 = 282
+ *       + 工作位24 + deploy_valid1        = 307
+ *       + 姿态快照24 + snap_valid1        = 332（补 0xFF 到 352）
+ * CRC 覆盖载荷前 332B。头最后写：中途断电整份作废。
+ * 只存点位，不存库存和 step——上电库存一律清零、step=0，
+ * 因为断电后车上实际有没有矿无从得知，必须人工核对（Watch 改 occupied 或 force）。
+ * 擦+写有全片取指停顿，只允许下档(电机已失能)时操作。                      */
 #define SLOT_FLASH_SECTOR    6u
 #define SLOT_FLASH_ADDR      0x080C0000u
-#define SLOT_FLASH_MAGIC     0x534C5431u    /* "SLT1" */
-#define SLOT_REC_BYTES       56u            /* take24 + place24 + take_valid + place_valid + occupied + 保留 */
-#define SLOT_IMG_BYTES       128u           /* 2×56=112 → 补到 4 个 32B flashword */
+#define SLOT_FLASH_MAGIC     0x534C5436u    /* "SLT6"：每槽加取矿上方点+抬出点，与旧版不兼容 */
+#define SLOT_REC_BYTES       128u
+#define SLOT_STOW_OFF        (ARM_SLOT_NUM * SLOT_REC_BYTES)              /* 256 */
+#define SLOT_DEPLOY_OFF      (SLOT_STOW_OFF + 26u)                        /* 282 */
+#define SLOT_SNAP_OFF        (SLOT_DEPLOY_OFF + 25u)                      /* 307 */
+#define SLOT_PAYLOAD_BYTES   (SLOT_SNAP_OFF + 24u + 1u)                   /* 332 */
+#define SLOT_IMG_BYTES       352u           /* 11 个 32B flashword */
 
-static void Slot_FlashWriteHeader(uint32_t magic, uint32_t crc)
+static HAL_StatusTypeDef Slot_FlashWriteHeader(uint32_t magic, uint32_t crc)
 {
     static uint32_t hdr[8] __ALIGNED(32);
     for(int i = 0; i < 8; i++) hdr[i] = 0xFFFFFFFFu;
@@ -1550,10 +1862,8 @@ static void Slot_FlashWriteHeader(uint32_t magic, uint32_t crc)
     hdr[1] = ARM_SLOT_NUM;
     hdr[2] = crc;
     hdr[3] = g_slot_base;
-    hdr[4] = (uint32_t)g_slot_place_ptr + 1u;    /* int8 可能为 -1，偏移后存 */
-    hdr[5] = (uint32_t)g_slot_take_ptr  + 1u;
-    hdr[6] = (uint32_t)g_slot_carry     + 1u;
-    (void)HAL_FLASH_Program(FLASH_TYPEPROGRAM_FLASHWORD, SLOT_FLASH_ADDR, (uint32_t)hdr);
+    hdr[4] = g_stow_valid;
+    return HAL_FLASH_Program(FLASH_TYPEPROGRAM_FLASHWORD, SLOT_FLASH_ADDR, (uint32_t)hdr);
 }
 
 static void Slot_FlashSave(void)
@@ -1566,13 +1876,25 @@ static void Slot_FlashSave(void)
     for(uint8_t s = 0; s < ARM_SLOT_NUM; s++)
     {
         uint8_t *r = img + s * SLOT_REC_BYTES;
-        memcpy(r, arm_slot[s].take,  sizeof(arm_slot[s].take));
-        memcpy(r + 24u, arm_slot[s].place, sizeof(arm_slot[s].place));
-        r[48u] = arm_slot[s].take_valid;
-        r[49u] = arm_slot[s].place_valid;
-        r[50u] = g_slot_occupied[s];
+        memcpy(r,       arm_slot[s].take,        24u);
+        memcpy(r + 24u, arm_slot[s].take_above,  24u);
+        memcpy(r + 48u, arm_slot[s].take_lift,   24u);
+        memcpy(r + 72u, arm_slot[s].place,       24u);
+        memcpy(r + 96u, arm_slot[s].place_above, 24u);
+        r[120u] = arm_slot[s].take_valid;
+        r[121u] = arm_slot[s].take_above_valid;
+        r[122u] = arm_slot[s].take_lift_valid;
+        r[123u] = arm_slot[s].place_valid;
+        r[124u] = arm_slot[s].above_valid;
     }
-    uint32_t crc = Teach_Crc32(img, ARM_SLOT_NUM * SLOT_REC_BYTES);
+    memcpy(img + SLOT_STOW_OFF, (const void *)g_stow_pos, 24u);
+    img[SLOT_STOW_OFF + 24u] = g_stow_valid;
+    img[SLOT_STOW_OFF + 25u] = g_slot_base;
+    memcpy(img + SLOT_DEPLOY_OFF, (const void *)g_deploy_pos, 24u);
+    img[SLOT_DEPLOY_OFF + 24u] = g_deploy_valid;
+    memcpy(img + SLOT_SNAP_OFF, (const void *)g_snap_pos, 24u);
+    img[SLOT_SNAP_OFF + 24u] = g_snap_valid;
+    uint32_t crc = Teach_Crc32(img, SLOT_PAYLOAD_BYTES);
 
     HAL_FLASH_Unlock();
     FLASH_EraseInitTypeDef er = {0};
@@ -1601,9 +1923,10 @@ static void Slot_FlashSave(void)
         }
         addr += 32u;
     }
-    Slot_FlashWriteHeader(SLOT_FLASH_MAGIC, crc);
+    HAL_StatusTypeDef st = Slot_FlashWriteHeader(SLOT_FLASH_MAGIC, crc);
     HAL_FLASH_Lock();
     g_arm_busy_until = 0;
+    if(st != HAL_OK) { g_slot_save_err = 2; return; }   /* 头写失败不能报成功 */
     g_slot_saved = 1u;
     g_slot_save_err = 0u;
 }
@@ -1626,7 +1949,7 @@ static void Slot_FlashLoad(void)
     if(hdr[1] != ARM_SLOT_NUM) { g_slot_save_err = 4; return; }
 
     const uint8_t *img = (const uint8_t *)(SLOT_FLASH_ADDR + 32u);
-    if(Teach_Crc32(img, ARM_SLOT_NUM * SLOT_REC_BYTES) != hdr[2])
+    if(Teach_Crc32(img, SLOT_PAYLOAD_BYTES) != hdr[2])
     {
         g_slot_save_err = 4;
         return;
@@ -1634,20 +1957,278 @@ static void Slot_FlashLoad(void)
     for(uint8_t s = 0; s < ARM_SLOT_NUM; s++)
     {
         const uint8_t *r = img + s * SLOT_REC_BYTES;
-        memcpy(arm_slot[s].take,  r,      sizeof(arm_slot[s].take));
-        memcpy(arm_slot[s].place, r + 24u, sizeof(arm_slot[s].place));
-        arm_slot[s].take_valid  = r[48u];
-        arm_slot[s].place_valid = r[49u];
-        g_slot_occupied[s]      = r[50u];
-        /* CRC 只保证字节没花，NaN/越界的点位照样不能用 */
-        if(!Arm_SlotPoseOk(arm_slot[s].take))  arm_slot[s].take_valid = 0u;
-        if(!Arm_SlotPoseOk(arm_slot[s].place)) arm_slot[s].place_valid = 0u;
+        memcpy(arm_slot[s].take,        r,       24u);
+        memcpy(arm_slot[s].take_above,  r + 24u, 24u);
+        memcpy(arm_slot[s].take_lift,   r + 48u, 24u);
+        memcpy(arm_slot[s].place,       r + 72u, 24u);
+        memcpy(arm_slot[s].place_above, r + 96u, 24u);
+        arm_slot[s].take_valid       = r[120u];
+        arm_slot[s].take_above_valid = r[121u];
+        arm_slot[s].take_lift_valid  = r[122u];
+        arm_slot[s].place_valid      = r[123u];
+        arm_slot[s].above_valid      = r[124u];
+        if(!Arm_SlotPoseOk(arm_slot[s].take))        arm_slot[s].take_valid = 0u;
+        if(!Arm_SlotPoseOk(arm_slot[s].take_above))  arm_slot[s].take_above_valid = 0u;
+        if(!Arm_SlotPoseOk(arm_slot[s].take_lift))   arm_slot[s].take_lift_valid = 0u;
+        if(!Arm_SlotPoseOk(arm_slot[s].place))       arm_slot[s].place_valid = 0u;
+        if(!Arm_SlotPoseOk(arm_slot[s].place_above)) arm_slot[s].above_valid = 0u;
     }
+    memcpy((void *)g_stow_pos, img + SLOT_STOW_OFF, 24u);
+    g_stow_valid = img[SLOT_STOW_OFF + 24u];
+    if(!Arm_SlotPoseOk(g_stow_pos)) g_stow_valid = 0u;
+    memcpy((void *)g_deploy_pos, img + SLOT_DEPLOY_OFF, 24u);
+    g_deploy_valid = img[SLOT_DEPLOY_OFF + 24u];
+    if(!Arm_SlotPoseOk(g_deploy_pos)) g_deploy_valid = 0u;
+    memcpy((void *)g_snap_pos, img + SLOT_SNAP_OFF, 24u);
+    g_snap_valid = img[SLOT_SNAP_OFF + 24u];
+    if(!Arm_SlotPoseOk(g_snap_pos)) g_snap_valid = 0u;
     g_slot_base = (hdr[3] == 3u) ? 3u : 1u;
-    if(hdr[4] <= ARM_SLOT_NUM + 1u) g_slot_place_ptr = (int8_t)hdr[4] - 1;
-    if(hdr[5] <= ARM_SLOT_NUM + 1u) g_slot_take_ptr  = (int8_t)hdr[5] - 1;
-    if(hdr[6] <= ARM_SLOT_NUM + 1u) g_slot_carry     = (int8_t)hdr[6] - 1;
+    /* 库存/step/carry 不恢复：上电默认空仓、step=0，人工核对后再作业 */
     g_slot_saved = 1u;
+}
+
+/* ===== HOME/STOW 状态机 + 四键分发 ======================================== */
+static uint8_t Arm_StowAtPose(void)
+{
+    if(!g_stow_valid) return 0u;
+    for(int i = 0; i < ARM_JOINT_NUM; i++)
+    {
+        DM_Motor_t *m = DM_Motor_Get(i);
+        if(m == NULL || !Arm_FbFresh(m)) return 0u;
+        if(fabsf(m->position - g_stow_pos[i]) > ARM_SLOT_WORK_TOL) return 0u;
+    }
+    return 1u;
+}
+
+/* Watch 标定收纳位：静止时录当前六轴绝对角。臂还在动就拒绝，不录歪姿态。 */
+static void Arm_StowPoseHandler(void)
+{
+    if(g_stow_pose_cmd == 0u) return;
+    uint8_t cmd = g_stow_pose_cmd;
+    g_stow_pose_cmd = 0u;
+    if(cmd == 2u) { g_stow_valid = 0u; return; }
+    if(cmd != 1u) return;
+    if(arm.state == ARM_STATE_DISABLED) { g_home_err = 4u; return; }
+    if(!Arm_SlotFbOk()) { g_home_err = 3u; return; }
+    float tmp[ARM_JOINT_NUM];
+    for(int i = 0; i < ARM_JOINT_NUM; i++)
+    {
+        DM_Motor_t *m = DM_Motor_Get(i);
+        if(fabsf(m->position - arm.cmd_smooth[i]) > ARM_SLOT_SETTLE_TOL ||
+           fabsf(m->velocity) > 0.05f) { g_home_err = 3u; return; }
+        tmp[i] = m->position;
+    }
+    if(!Arm_SlotPoseOk(tmp)) { g_home_err = 2u; return; }
+    for(int i = 0; i < ARM_JOINT_NUM; i++) g_stow_pos[i] = tmp[i];
+    g_stow_valid = 1u;
+    g_home_err = 0u;
+}
+
+/* Watch 标定工作位：与收纳位同一套门槛（跟随态 + 六轴反馈新鲜 + 确实静止 + 点位合法）。
+   工作位是所有自动动作的交接点，录歪了后面每一步都歪，所以静止判据和收纳位一样严。 */
+static void Arm_DeployPoseHandler(void)
+{
+    if(g_deploy_pose_cmd == 0u) return;
+    uint8_t cmd = g_deploy_pose_cmd;
+    g_deploy_pose_cmd = 0u;
+    if(cmd == 2u) { g_deploy_valid = 0u; return; }
+    if(cmd != 1u) return;
+    if(arm.state == ARM_STATE_DISABLED) { g_home_err = 4u; return; }
+    if(!Arm_SlotFbOk())                 { g_home_err = 3u; return; }
+
+    float tmp[ARM_JOINT_NUM];
+    for(int i = 0; i < ARM_JOINT_NUM; i++)
+    {
+        DM_Motor_t *m = DM_Motor_Get(i);
+        if(fabsf(m->position - arm.cmd_smooth[i]) > ARM_SLOT_SETTLE_TOL ||
+           fabsf(m->velocity) > 0.05f) { g_home_err = 3u; return; }
+        tmp[i] = m->position;
+    }
+    if(!Arm_SlotPoseOk(tmp)) { g_home_err = 2u; return; }
+
+    for(int i = 0; i < ARM_JOINT_NUM; i++) g_deploy_pos[i] = tmp[i];
+    g_deploy_valid = 1u;
+    g_home_err = 0u;
+}
+
+/* 走到任意合法姿态：HOME 状态机只认 home_goal，这里做成统一入口 */
+static void Arm_HomeStartPose(const volatile float *pose, uint8_t st)
+{
+    if(pose == NULL || !Arm_SlotPoseOk(pose)) { g_home_err = 2u; return; }
+
+    float worst = 0.0f;
+    for(int i = 0; i < ARM_JOINT_NUM; i++)
+    {
+        home_goal[i] = pose[i];
+        float d = fabsf(Arm_ClampJoint(i, pose[i]) - arm.cmd_smooth[i]);
+        if(d > worst) worst = d;
+    }
+    float speed = (g_deploy_speed > 0.05f) ? g_deploy_speed : 0.05f;
+    uint32_t est = (uint32_t)((worst / speed) * 1000.0f);
+    if(est < 2000u) est = 2000u;
+    home_deadline = HAL_GetTick() + est * 3u;
+    home_hold = 0;
+    g_home_err = 0u;
+    g_home_state = st;
+}
+
+static void Arm_HomeStartMove(uint8_t to_stow)
+{
+    const volatile float *pose = to_stow ? g_stow_pos : g_deploy_pos;
+    if(!to_stow && !g_deploy_valid) { g_home_err = 2u; return; }  /* 未标定工作位：拒绝动作 */
+    if(to_stow && !g_stow_valid)    { g_home_err = 2u; return; }  /* 未标定收纳位：拒绝动作 */
+    Arm_HomeStartPose(pose, to_stow ? ARM_HOME_GO_STOW : ARM_HOME_GO_WORK);
+}
+
+/* 姿态快照：1=存当前姿态 2=清除 3=走回去。
+   存的时候要求臂真静止，和录点位同一套判据；走回去复用 HOME 状态机。 */
+static void Arm_SnapHandler(void)
+{
+    if(g_snap_cmd == 0u) return;
+    uint8_t cmd = g_snap_cmd;
+    g_snap_cmd = 0u;
+
+    if(cmd == 2u) { g_snap_valid = 0u; return; }
+
+    if(cmd == 1u)
+    {
+        if(arm.state == ARM_STATE_DISABLED) { g_home_err = 4u; return; }
+        if(!Arm_SlotFbOk())                 { g_home_err = 3u; return; }
+
+        float tmp[ARM_JOINT_NUM];
+        for(int i = 0; i < ARM_JOINT_NUM; i++)
+        {
+            DM_Motor_t *m = DM_Motor_Get(i);
+            if(fabsf(m->position - arm.cmd_smooth[i]) > ARM_SLOT_SETTLE_TOL ||
+               fabsf(m->velocity) > 0.05f) { g_home_err = 3u; return; }
+            tmp[i] = m->position;
+        }
+        if(!Arm_SlotPoseOk(tmp)) { g_home_err = 2u; return; }
+
+        for(int i = 0; i < ARM_JOINT_NUM; i++) g_snap_pos[i] = tmp[i];
+        g_snap_valid = 1u;
+        g_home_err = 0u;
+        return;
+    }
+
+    if(cmd == 3u)
+    {
+        if(!g_snap_valid) { g_home_err = 2u; return; }
+        if(g_home_state == ARM_HOME_GO_WORK || g_home_state == ARM_HOME_GO_STOW)
+        {
+            g_home_err = 1u;      /* 正在走，别叠加 */
+            return;
+        }
+        Arm_HomeStartPose(g_snap_pos, ARM_HOME_GO_WORK);
+        return;
+    }
+}
+
+/* 重新吸合跟随：清偏移，由关节循环逐轴捕获新鲜偏移（不新鲜的不捕获、不动） */
+static void Arm_TakeoverFollow(void)
+{
+    arm.q_offset_valid = 0;
+    arm_q_offset_mask = 0;
+    arm_catchup_mask = 0;
+    arm_reclutch_req = 0;
+    Arm_InterpResetAll();
+    g_home_state = ARM_HOME_FOLLOW;
+    g_home_err = 0u;
+}
+
+static void Arm_HomeTick(void)
+{
+    if(g_home_state != ARM_HOME_GO_WORK && g_home_state != ARM_HOME_GO_STOW) return;
+    if(arm.state != ARM_STATE_FOLLOWING || !arm.connected)
+    {
+        g_home_state = ARM_HOME_HOLD_WORK;     /* 档位/链路丢：原地保持 */
+        return;
+    }
+    if(!Arm_SlotFbOk())
+    {
+        g_home_state = ARM_HOME_HOLD_WORK;
+        g_home_err = 3u;
+        return;
+    }
+    if((int32_t)(HAL_GetTick() - home_deadline) >= 0)
+    {
+        g_home_state = ARM_HOME_HOLD_WORK;
+        g_home_err = 3u;
+        return;
+    }
+    uint8_t all_at = 1u;
+    for(int i = 0; i < ARM_JOINT_NUM; i++)
+    {
+        DM_Motor_t *m = DM_Motor_Get(i);
+        if(m == NULL || !Arm_FbFresh(m) ||
+           fabsf(m->position - home_goal[i]) > ARM_SLOT_ARRIVE_TOL) { all_at = 0u; break; }
+    }
+    if(!all_at) { home_hold = 0; return; }
+    if(++home_hold < ARM_SLOT_HOLD_TICKS) return;
+    /* 到位后自动交还跟随：只要主手在线就重新吸合，不用再按一次 HOME。
+       主手不在线（没上档/没 deadman）就原地保持，等下次接管。 */
+    {
+        uint8_t arrived = g_home_state;
+        home_hold = 0;
+        if(arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active)
+        {
+            Arm_TakeoverFollow();
+        }
+        else
+        {
+            g_home_state = (arrived == ARM_HOME_GO_STOW) ? ARM_HOME_HOLD_STOW : ARM_HOME_HOLD_WORK;
+        }
+    }
+}
+
+/* 控制环每拍弹出一个按键事件执行。所有自动动作都要求上档+主手在线(FOLLOWING)。
+   HOME=归位/接管，STOW=收纳/展开，ORE=按固定顺序做一步矿位作业，GRIP=手动翻爪。 */
+static void Arm_ButtonTick(void)
+{
+    uint8_t action = Arm_EventPop();
+    if(action == 0u) return;
+    if(arm.state != ARM_STATE_FOLLOWING || !arm.connected) { g_home_err = 4u; return; }
+
+    uint8_t moving  = (g_home_state == ARM_HOME_GO_WORK || g_home_state == ARM_HOME_GO_STOW) ? 1u : 0u;
+    uint8_t mission = (g_slot_enable && g_slot_state != ARM_SLOT_ST_IDLE) ? 1u : 0u;
+
+    switch(action)
+    {
+    case 4u:   /* GRIP：自动流程占着夹爪时忽略手动 */
+        if(!mission && !moving) arm.gripper_cmd_recv ^= 1u;
+        return;
+    case 3u:   /* HOME：中止矿位流程→回工作位；工作位保持时再按=接管跟随 */
+        if(mission) Arm_SlotStop(ARM_SLOT_ERR_NONE);
+        if(moving) { g_home_err = 1u; return; }
+        /* 工作位还没标定时没有"回到哪"可判，HOME 直接接管跟随，让操作手先把姿态摆出来录点 */
+        if(g_home_state == ARM_HOME_HOLD_WORK && (!g_deploy_valid || Arm_SlotAtWorkPose()))
+        {
+            Arm_TakeoverFollow();
+            return;
+        }
+        Arm_HomeStartMove(0u);
+        return;
+    case 1u:   /* STOW：在收纳位→展开到工作位；否则收纳（未标定拒绝） */
+        if(mission || moving) { g_home_err = 1u; return; }
+        if(g_home_state == ARM_HOME_HOLD_STOW || Arm_StowAtPose()) Arm_HomeStartMove(0u);
+        else Arm_HomeStartMove(1u);
+        return;
+    case 2u:   /* ORE：忙则忽略不跳步；收纳位需先展开；按 step 选放/取 */
+        if(mission || moving) { g_home_err = 1u; return; }
+        if(g_home_state == ARM_HOME_HOLD_STOW) { g_home_err = 4u; return; }
+        if(!g_slot_enable) { g_home_err = 4u; return; }
+        if(Arm_SlotBusy())  { g_slot_err = ARM_SLOT_ERR_BUSY;     return; }
+        if(!Arm_SlotFbOk()) { g_slot_err = ARM_SLOT_ERR_FEEDBACK; return; }
+        {
+            uint8_t prev = g_home_state;
+            if(g_slot_step < 2u) Arm_SlotStartPlace();
+            else                 Arm_SlotStartTake();
+            g_home_state = (g_slot_state != ARM_SLOT_ST_IDLE) ? ARM_HOME_HOLD_WORK : prev;
+        }
+        return;
+    default:
+        return;
+    }
 }
 
 /* ===== 电机总线扫描（诊断用，Watch 控制）=====
@@ -1714,9 +2295,82 @@ static float Arm_SaneF(volatile float *p, float lo, float hi, float dflt)
     return v;
 }
 
+/* 每拍把六轴与状态位汇总到 g_arm_dbg，Watch 里只看这一项。
+   放在 Arm_UpdateState() 之后、失能早退之前，这样失能态也能看到角度。 */
+static void Arm_DbgUpdate(void)
+{
+    volatile ArmDbg_t *d = &g_arm_dbg;
+    float err_max = 0.0f;
+    uint8_t mask  = 0u;
+    uint8_t code  = 0u;
+    uint8_t fb    = 0u;
+
+    for(int i = 0; i < ARM_JOINT_NUM; i++)
+    {
+        DM_Motor_t *m = DM_Motor_Get((uint8_t)i);
+        float q = (m != NULL) ? m->position : 0.0f;
+        float c = arm.cmd_smooth[i];
+        float t = arm.target_joint[i];
+        float e = fabsf(q - c);
+
+        if(e > err_max) err_max = e;
+        if(m != NULL && Arm_FbFresh(m)) fb |= (uint8_t)(1u << i);
+        if(m != NULL && m->error != 1u)
+        {
+            mask |= (uint8_t)(1u << i);
+            if(code == 0u) code = m->error;
+        }
+
+        switch(i)
+        {
+        case 0: d->q1 = q; d->d1 = q * 57.29578f; d->c1 = c; d->t1 = t; break;
+        case 1: d->q2 = q; d->d2 = q * 57.29578f; d->c2 = c; d->t2 = t; break;
+        case 2: d->q3 = q; d->d3 = q * 57.29578f; d->c3 = c; d->t3 = t; break;
+        case 3: d->q4 = q; d->d4 = q * 57.29578f; d->c4 = c; d->t4 = t; break;
+        case 4: d->q5 = q; d->d5 = q * 57.29578f; d->c5 = c; d->t5 = t; break;
+        default: d->q6 = q; d->d6 = q * 57.29578f; d->c6 = c; d->t6 = t; break;
+        }
+    }
+
+    {
+        DM_Motor_t *gm = DM_Motor_Get(ARM_JOINT_NUM);
+        d->grip_pos = (gm != NULL) ? gm->position : 0.0f;
+    }
+    d->grip_cmd    = arm.target_gripper;
+    d->err_max     = err_max;
+    d->err_max_deg = err_max * 57.29578f;
+
+    d->state     = (uint8_t)arm.state;
+    d->home      = g_home_state;
+    d->slot      = g_slot_state;
+    d->teach     = g_teach_state;
+    d->connected = arm.connected;
+    d->active    = arm.active;
+    d->q_off     = arm.q_offset_valid;
+    d->deploy_ok = g_deploy_valid;
+    d->stow_ok   = g_stow_valid;
+    d->snap_ok   = g_snap_valid;
+    d->m_err_mask = mask;
+    d->m_err      = code;
+    d->fb_mask    = fb;
+    d->slot_err   = g_slot_err;
+    d->home_err   = g_home_err;
+    d->slot_step  = g_slot_step;
+    d->slot_occ   = (uint8_t)((g_slot_occupied[0] ? 1u : 0u) | (g_slot_occupied[1] ? 2u : 0u));
+    d->slot_v     = (uint8_t)((arm_slot[0].take_valid  ? 1u : 0u) |
+                              (arm_slot[0].place_valid ? 2u : 0u) |
+                              (arm_slot[1].take_valid  ? 4u : 0u) |
+                              (arm_slot[1].place_valid ? 8u : 0u) |
+                              (arm_slot[0].above_valid ? 16u : 0u) |
+                              (arm_slot[1].above_valid ? 32u : 0u));
+}
+
 void Arm_ControlLoop(void)
 {
     g_arm_loop_tick = HAL_GetTick();
+
+    /* 发帧分频的相位，每拍轮转一次；ARM_TX_DECIMATE=1 时恒为 0（原行为） */
+    arm_tx_div = (uint8_t)((arm_tx_div + 1u) % ARM_TX_DECIMATE);
 
     /* Watch 误写防护：NaN/越界一律回退默认，别让非法值进 PVT 帧 */
     Arm_SaneF(&g_grip_open,   -5.0f, 5.0f, -1.72f);
@@ -1789,6 +2443,7 @@ void Arm_ControlLoop(void)
     }
 
     Arm_UpdateState();
+    Arm_DbgUpdate();
 
     Arm_BusScanTick();
 
@@ -1797,7 +2452,8 @@ void Arm_ControlLoop(void)
     if(arm_reclutch_req)
     {
         arm_reclutch_req = 0;
-        if(arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active)
+        if(g_home_state == ARM_HOME_FOLLOW &&
+           arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active)
         {
             arm.q_offset_valid = 0;
             arm_q_offset_mask = 0;
@@ -1807,10 +2463,14 @@ void Arm_ControlLoop(void)
         }
     }
 
+    Arm_DeployPoseHandler();
+    Arm_StowPoseHandler();
+    Arm_SnapHandler();
+    Arm_ButtonTick();
+
     Arm_TeachHandleRequest();
 
-    /* 命令码 2 = 一键取矿序列：先到工作位，到位后自动接着下探取矿位，中间不等第二次按键 */
-    static uint8_t deploy_seq_phase = 0;   /* 0=正走向工作位  1=正走向取矿位 */
+    /* 旧的"工作位→取矿位"两段序列已由矿位点位表（arm_slot[]）取代 */
     static uint8_t deploy_last = 0;
     static uint8_t deploy_code_last = 0;
 
@@ -1847,8 +2507,9 @@ void Arm_ControlLoop(void)
             Arm_TeachStopReplay();
         g_cycle_state = 0u;
         deploy_last = 0;
-        deploy_seq_phase = 0;
         if(g_slot_state != ARM_SLOT_ST_IDLE) Arm_SlotStop(ARM_SLOT_ERR_MODE);
+        g_home_state = ARM_HOME_HOLD_WORK;   /* 失能后必须 HOME 重新接管，不自动跟随 */
+        home_hold = 0;
         return;
     }
 
@@ -1872,41 +2533,51 @@ void Arm_ControlLoop(void)
         arm_interp_left--;
     }
 
-    /* 抽臂/取矿生效条件：遥控器上档 + 主手在线 + 命令码 1/2（3 是循环脉冲，另走 Arm_CycleTick） */
+    /* 抽臂/取矿生效条件：遥控器上档 + 主手在线 + 命令码 1/2（3 是循环脉冲，另走 Arm_CycleTick）。
+       旧自动命令只在跟随态(g_home_state==0)生效，四键流程占用臂时不抢目标。 */
     uint8_t in_deploy = ((arm_deploy_cmd == 1u || arm_deploy_cmd == 2u) && arm.connected &&
-                         arm.state == ARM_STATE_FOLLOWING) ? 1u : 0u;
-    volatile float *deploy_goal = (arm_deploy_cmd == 2u && deploy_seq_phase == 1u)
-                                ? g_mine_pos : g_deploy_pos;
+                         arm.state == ARM_STATE_FOLLOWING &&
+                         g_home_state == ARM_HOME_FOLLOW && g_deploy_valid) ? 1u : 0u;
+    /* 旧的"工作位→取矿位"两段序列已由矿位点位表取代：cmd 1/2 现在都只回工作位 */
+    const volatile float *deploy_goal = g_deploy_pos;
     if(in_deploy && (!deploy_last || deploy_code_last != arm_deploy_cmd))
     {
         arm_deploy_hold = 0;      /* cmd_smooth 保持上一拍，从当前位置起步 */
-        deploy_seq_phase = 0;     /* 序列从头开始 */
     }
     if(!in_deploy && deploy_last)
     {
         arm_reclutch_req = 1;     /* 交还跟随：以当前位置重新吸合，不跳 */
-        deploy_seq_phase = 0;
     }
     deploy_last = in_deploy;
     deploy_code_last = arm_deploy_cmd;
 
     uint8_t in_cycle_move = ((g_cycle_state == 1u || g_cycle_state == 2u) &&
-                             arm.state == ARM_STATE_FOLLOWING && arm.connected) ? 1u : 0u;
+                             arm.state == ARM_STATE_FOLLOWING && arm.connected &&
+                             g_home_state == ARM_HOME_FOLLOW) ? 1u : 0u;
     /* 循环驱动的回放/保持不要求主手使能：按键序列期间主手可能不在零力模式 */
     uint8_t in_teach = ((g_teach_state == ARM_TEACH_REPLAY || g_teach_state == ARM_TEACH_DONE || g_teach_state == ARM_TEACH_RETURN) &&
                         arm.state == ARM_STATE_FOLLOWING && arm.connected &&
+                        g_home_state == ARM_HOME_FOLLOW &&
                         (arm.active || g_cycle_state != 0u) && !in_deploy) ? 1u : 0u;
-    /* 矿位流程：in_slot_hold = 流程占着臂（含张爪保持，此时谁都不许动目标）；
-       in_slot_move = 正在走向某个点位的行走段。抽臂/循环优先，见下面的分支顺序。 */
+    /* 矿位流程：in_slot_hold = 流程占着臂（含张爪/合爪保持，此时谁都不许动目标）；
+       in_slot_move = 正在走向某个点位的行走段。 */
     uint8_t in_slot_move = ((g_slot_state == ARM_SLOT_ST_GO_WORK || g_slot_state == ARM_SLOT_ST_GO_PLACE ||
+                             g_slot_state == ARM_SLOT_ST_GO_PLACE_ABOVE ||
+                             g_slot_state == ARM_SLOT_ST_GO_TAKE_ABOVE ||
+                             g_slot_state == ARM_SLOT_ST_GO_TAKE_LIFT ||
+                             g_slot_state == ARM_SLOT_ST_GO_TAKE_ABOVE_RET ||
                              g_slot_state == ARM_SLOT_ST_BACK || g_slot_state == ARM_SLOT_ST_GO_TAKE) &&
                             arm.state == ARM_STATE_FOLLOWING && arm.connected) ? 1u : 0u;
     uint8_t in_slot_hold = (g_slot_enable && g_slot_state != ARM_SLOT_ST_IDLE) ? 1u : 0u;
+    /* HOME/STOW 行走段与工作位/收纳位保持 */
+    uint8_t in_home_move = ((g_home_state == ARM_HOME_GO_WORK || g_home_state == ARM_HOME_GO_STOW) &&
+                            arm.state == ARM_STATE_FOLLOWING && arm.connected) ? 1u : 0u;
+    uint8_t in_home_hold = (g_home_state == ARM_HOME_HOLD_WORK || g_home_state == ARM_HOME_HOLD_STOW) ? 1u : 0u;
 
     /* 自动运动期间任一关节反馈丢失 = 整段冻结：目标和游标都不前进，
        免得其余关节继续走把轨迹走歪；反馈恢复后从冻结点继续 */
     uint8_t auto_fb_ok = 1;
-    if(in_deploy || in_cycle_move || in_teach || in_slot_move)
+    if(in_deploy || in_cycle_move || in_teach || in_slot_move || in_home_move)
     {
         for(int i = 0; i < ARM_JOINT_NUM; i++)
         {
@@ -1957,21 +2628,30 @@ void Arm_ControlLoop(void)
             float step = g_deploy_speed * ARM_CTRL_PERIOD_S;
             arm.cmd_smooth[i] = Arm_RateLimit(goal, arm.cmd_smooth[i], step);
         }
+        else if(in_home_move && auto_fb_ok && m->rx_cnt > 0)
+        {
+            /* HOME/STOW 行走段：走工作位/收纳位绝对角，速度同抽臂 */
+            float goal = Arm_ClampJoint(i, home_goal[i]);
+            float step = g_deploy_speed * ARM_CTRL_PERIOD_S;
+            arm.cmd_smooth[i] = Arm_RateLimit(goal, arm.cmd_smooth[i], step);
+        }
         else if(arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active && m->rx_cnt > 0 &&
-           !(arm_q_offset_mask & joint_bit) && !in_slot_hold)
+           g_home_state == ARM_HOME_FOLLOW && !(arm_q_offset_mask & joint_bit) && !in_slot_hold)
         {
             /* Capture each joint independently; one late motor must not leave
                the remaining joints running with an implicit zero offset. */
             arm.q_offset[i]   = ARM_DIR[i] * arm.target_joint[i] - m->position;
             arm.cmd_smooth[i] = m->position;
-            arm_prev_cmd[i]   = m->position;   /* no velocity kick at clutch */
+            arm_last_tx_cmd[i] = m->position;   /* no velocity kick at clutch */
+            arm_last_tx_ms[i]  = now;
             Arm_InterpResetJoint(i);
             arm_q_offset_mask |= joint_bit;
             arm.q_offset_valid =
                 (arm_q_offset_mask == ((1u << ARM_JOINT_NUM) - 1u));
         }
 
-        if(!in_deploy && !in_teach && !in_cycle_move && !in_slot_hold && arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active &&
+        if(!in_deploy && !in_teach && !in_cycle_move && !in_slot_hold && !in_home_move && !in_home_hold &&
+           g_home_state == ARM_HOME_FOLLOW && arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active &&
            (arm_q_offset_mask & joint_bit) && m->rx_cnt > 0)
         {
             if(arm.connected)
@@ -2022,13 +2702,7 @@ void Arm_ControlLoop(void)
             arm.cmd_smooth[i] = arm_lock_pos[i];
         }
 
-        /* commanded speed with a floor so the inner loop can still hold the pose */
-        float vmag = fabsf(arm.cmd_smooth[i] - arm_prev_cmd[i]) / ARM_CTRL_PERIOD_S;
-        arm_prev_cmd[i] = arm.cmd_smooth[i];
-        if(vmag < ARM_VEL_MIN_RAD_S) vmag = ARM_VEL_MIN_RAD_S;
-        if(vmag > ARM_VEL_MAX_RAD_S) vmag = ARM_VEL_MAX_RAD_S;
-
-        /* jitter tracking (500Hz) */
+        /* 抖动诊断每拍采样，与发帧率无关，保持 500Hz 观测分辨率 */
         {
             float trk = fabsf(m->position - arm.cmd_smooth[i]);
             if(trk > g_trk_err_peak[i]) g_trk_err_peak[i] = trk;
@@ -2038,40 +2712,55 @@ void Arm_ControlLoop(void)
         if(m->position < dbg_pos_min[i]) dbg_pos_min[i] = m->position;
         if(m->position > dbg_pos_max[i]) dbg_pos_max[i] = m->position;
 
+        /* 奇偶错峰分频：本拍不发这一轴（cmd_smooth 仍每拍推进，下一拍发的是最新值） */
+        if(((arm_tx_div + (uint8_t)i) % ARM_TX_DECIMATE) != 0u) continue;
+
+        /* 速度 = 自上次发帧以来的位移 / 实际经过时间 */
+        uint32_t dt_ms = (uint32_t)(now - arm_last_tx_ms[i]);
+        if(dt_ms == 0u || dt_ms > (uint32_t)(ARM_TX_INTERVAL_S * 2000.0f))
+        {
+            /* 断档后第一帧（初次合闸 / 反馈丢失跳过 / 失能再使能）没有可信历史，
+               按"无新增位移"处理，速度落到下限，避免一帧天量前馈 */
+            dt_ms = (uint32_t)(ARM_TX_INTERVAL_S * 1000.0f);
+            arm_last_tx_cmd[i] = arm.cmd_smooth[i];
+        }
+        float vmag = fabsf(arm.cmd_smooth[i] - arm_last_tx_cmd[i]) * 1000.0f / (float)dt_ms;
+        if(vmag < ARM_VEL_MIN_RAD_S) vmag = ARM_VEL_MIN_RAD_S;
+        if(vmag > ARM_VEL_MAX_RAD_S) vmag = ARM_VEL_MAX_RAD_S;
+
         DM_Motor_PVT_Control(m->hfdcan, m->can_id,
                              arm.cmd_smooth[i], vmag, ARM_CUR_LIMIT[i]);
+        arm_last_tx_cmd[i] = arm.cmd_smooth[i];
+        arm_last_tx_ms[i]  = now;
 
     }
 
     Arm_TeachTickAfterJoints();
+
+    /* Watch 命令码3(旧一键循环)边沿本拍只生成一次，交给 Arm_CycleTick 认领 */
+    {
+        static uint8_t cmd3_last = 0;
+        uint8_t cmd3 = (arm_deploy_cmd == 3u) ? 1u : 0u;
+        arm_cmd3_edge = (uint8_t)(cmd3 && !cmd3_last);
+        cmd3_last = cmd3;
+    }
+
     Arm_CycleTick();
     Arm_SlotTick();
-
-    /* 一键取矿序列：工作位到位后自动接下一段，不停在中间。
-       到位标志必须在切段之后算：切段这一拍旧段的"已到位"不能带进新段，
-       否则 g_deploy_state 直接跳 4，夹爪在去取矿位的半路上就提前闭合。 */
-    if(in_deploy && arm_deploy_cmd == 2u && deploy_seq_phase == 0u &&
-       arm_deploy_hold == ((1u << ARM_JOINT_NUM) - 1u))
-    {
-        deploy_seq_phase = 1u;
-        arm_deploy_hold  = 0;   /* 下一拍 deploy_goal 自动切到 g_mine_pos */
-    }
+    Arm_HomeTick();
+    arm_cmd3_edge = 0u;   /* 没人认领也不留到下一拍：cmd3 电平持续期间只在上升沿触发一次 */
 
     uint8_t deploy_all_hold = (arm_deploy_hold == ((1u << ARM_JOINT_NUM) - 1u)) ? 1u : 0u;
 
-    if(!in_deploy)
-        g_deploy_state = 0u;
-    else if(arm_deploy_cmd == 1u)
-        g_deploy_state = deploy_all_hold ? 2u : 1u;
-    else
-        g_deploy_state = (deploy_seq_phase == 1u) ? (deploy_all_hold ? 4u : 3u) : 1u;
+    if(!in_deploy) g_deploy_state = 0u;
+    else           g_deploy_state = deploy_all_hold ? 2u : 1u;
 
 #if ARM_USE_GRIPPER
     /* ===== 夹爪：第 7 个电机（索引 ARM_JOINT_NUM）=====
      * 控制帧必须无条件下发 —— 达妙电机使能后收不到控制帧会判通讯丢失、自行
      * 退出使能（表现为"绿一下又变红"）。拿到首帧反馈前电流限幅发 0，
      * 既保活又不产生力矩，目标停在 0 也不会猛甩。
-     * 中档保持位置；上档按主手按键开合（0=张开 1=闭合）。 */
+     * 中档保持位置；上档由从手自持期望开合（GRIP 按键翻转 / 矿位流程到位改写）。 */
     {
         static uint32_t t_grip_tx = 0;
         DM_Motor_t *gm = DM_Motor_Get(ARM_JOINT_NUM);
@@ -2093,27 +2782,20 @@ void Arm_ControlLoop(void)
                     arm.target_gripper = gm->position;
                     arm_grip_synced = 1;
                 }
-                cur = g_grip_cur;
+                /* 反馈不新鲜时电流限幅发0：保活但不拿冻结位置灌电流 */
+                cur = Arm_FbFresh(gm) ? g_grip_cur : 0.0f;
 
-                /* 只有上档且主手在线使能时才推动目标；中档保持上一次的目标不动。
-                   循环行走段(去工作位/去轨迹首点)冻结目标：可能正夹着矿，强制张开会掉矿。 */
-                uint8_t slot_grip_freeze = (g_slot_enable && (g_slot_state == ARM_SLOT_ST_GO_WORK ||
-                                             g_slot_state == ARM_SLOT_ST_GO_PLACE ||
-                                             g_slot_state == ARM_SLOT_ST_BACK)) ? 1u : 0u;
-                uint8_t slot_grip_open   = (g_slot_enable && g_slot_state == ARM_SLOT_ST_OPEN) ? 1u : 0u;
-
-                if(arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active &&
-                   !in_cycle_move && !slot_grip_freeze)
+                /* 夹爪期望 arm.gripper_cmd_recv 由从手自持：GRIP 按键翻转、矿位流程在
+                   到位瞬间改写（放矿到位才张、取矿到位才合），运输段保持不变即夹稳矿。
+                   只有上档+主手在线使能才推动目标；中档/循环行走段保持上一次目标。 */
+                if(Arm_FbFresh(gm) && arm.state == ARM_STATE_FOLLOWING && arm.connected &&
+                   arm.active && !in_cycle_move)
                 {
-                    /* 一键取矿的整个序列期间，夹爪一律张到最大(g_grip_open)：
-                       主手启动时就发了 grip=1，中途合会在下探路上把矿推开。
-                       只有走到取矿位(state=4)这一拍才放行，实现"最后一瞬间才夹" */
                     uint8_t grip_req = arm.gripper_cmd_recv;
+                    /* 旧 Watch 一键取矿(cmd2)：序列期间张爪，到取矿位才合（保留调试路径） */
                     if(arm_deploy_cmd == 2u && g_deploy_state != 4u) grip_req = 0u;
                     if(in_teach)
                         grip_req = (g_teach_state == ARM_TEACH_RETURN) ? 0u : teach_replay_grip;
-                    /* 矿位流程：只有停在放矿位这一拍才允许张开，路上绝不松爪 */
-                    if(slot_grip_open) grip_req = 0u;
 
                     float want = grip_req ? g_grip_close : g_grip_open;
                     float err  = want - arm.target_gripper;

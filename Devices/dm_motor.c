@@ -1,4 +1,5 @@
 #include "dm_motor.h"
+#include "dm_fdcan.h"
 #include <string.h>
 
 // 7 motor instances
@@ -23,8 +24,17 @@ static float uint_to_float(uint16_t x, float x_min, float x_max, int bits)
 
 volatile uint32_t can_tx_fifo_full = 0;
 volatile uint32_t can_tx_fail = 0;
-// Send one CAN frame
-static void DM_CAN_Send(FDCAN_HandleTypeDef *hfdcan, uint32_t std_id, uint8_t *data)
+
+/* 最近一次 PVT 实际编码值回读：用于区分“控制环目标错”和“驱动发错/没发出”。
+   按电机 CAN ID 1..7 索引，-1 表示从未发送。数组按轴存放，J4 对应索引3。 */
+volatile float    dm_pvt_tx_pos[DM_MOTOR_NUM]     = {0};
+volatile uint16_t dm_pvt_tx_vel_raw[DM_MOTOR_NUM] = {0};
+volatile uint16_t dm_pvt_tx_cur_raw[DM_MOTOR_NUM] = {0};
+volatile uint32_t dm_pvt_tx_ok[DM_MOTOR_NUM]      = {0};
+volatile uint8_t  dm_pvt_tx_frame[DM_MOTOR_NUM][8] = {{0}};
+
+// Send one CAN frame; 1=已成功放入 TX FIFO，0=未发出
+static uint8_t DM_CAN_Send(FDCAN_HandleTypeDef *hfdcan, uint32_t std_id, uint8_t *data)
 {
     FDCAN_TxHeaderTypeDef txHeader;
     txHeader.Identifier = std_id;
@@ -32,8 +42,7 @@ static void DM_CAN_Send(FDCAN_HandleTypeDef *hfdcan, uint32_t std_id, uint8_t *d
     txHeader.TxFrameType = FDCAN_DATA_FRAME;
     txHeader.DataLength = FDCAN_DLC_BYTES_8;
     txHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-    txHeader.BitRateSwitch = FDCAN_BRS_OFF;
-    txHeader.FDFormat = FDCAN_CLASSIC_CAN;
+    DM_FDCAN_FillTxHeader(&txHeader);
     txHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
     txHeader.MessageMarker = 0;
 
@@ -45,8 +54,15 @@ static void DM_CAN_Send(FDCAN_HandleTypeDef *hfdcan, uint32_t std_id, uint8_t *d
     }
     if(HAL_FDCAN_GetTxFifoFreeLevel(hfdcan) > 0)
     {
-        if(HAL_FDCAN_AddMessageToTxFifoQ(hfdcan, &txHeader, data) != HAL_OK) can_tx_fail++;
-    } else { can_tx_fifo_full++; }
+        if(HAL_FDCAN_AddMessageToTxFifoQ(hfdcan, &txHeader, data) != HAL_OK)
+        {
+            can_tx_fail++;
+            return 0u;
+        }
+        return 1u;
+    }
+    can_tx_fifo_full++;
+    return 0u;
 }
 
 // 7 motors, types from bottom: J1=4340, J2=J8009, J3=4340, J4=4310, J5=4310, J6=6220, Gripper=4310
@@ -83,9 +99,12 @@ void DM_Motor_Init(void)
     // J4: 4310
     dm_motors[3].can_id = DM_J4_ID;
     dm_motors[3].hfdcan = &hfdcan1;
+    /* A 方案：J4 电机的 PMAX 必须恢复为 12.5 并在工具里保存、断电重启，
+       与原有全部点位/示教坐标保持一致。VMAX/TMAX 仍按该电机实际值 45/7
+       解码，不能沿用错误的 50/10。 */
     dm_motors[3].q_max = 12.5f;
-    dm_motors[3].dq_max = 50.0f;
-    dm_motors[3].tau_max = 10.0f;
+    dm_motors[3].dq_max = 45.0f;
+    dm_motors[3].tau_max = 7.0f;
 
     // J5: 4310
     dm_motors[4].can_id = DM_J5_ID;
@@ -227,7 +246,18 @@ void DM_Motor_PVT_Control(FDCAN_HandleTypeDef *hfdcan, uint8_t motor_id,
     data[6] = ibuf[0];
     data[7] = ibuf[1];
 
-    DM_CAN_Send(hfdcan, 0x300 + motor_id, data);
+    uint8_t sent = DM_CAN_Send(hfdcan, 0x300 + motor_id, data);
+
+    /* 发送器实际看到的值，不是控制环里的近似值 */
+    if(hfdcan == &hfdcan1 && motor_id >= 1u && motor_id <= DM_MOTOR_NUM)
+    {
+        uint8_t idx = (uint8_t)(motor_id - 1u);
+        dm_pvt_tx_pos[idx]     = pos;
+        dm_pvt_tx_vel_raw[idx] = u16_vel;
+        dm_pvt_tx_cur_raw[idx] = u16_cur;
+        memcpy((void *)dm_pvt_tx_frame[idx], data, 8u);
+        if(sent) dm_pvt_tx_ok[idx]++;
+    }
 }
 
 // Parse feedback (Master ID = 0x11~0x17, low 4 bits = motor CAN ID)

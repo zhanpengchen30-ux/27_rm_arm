@@ -92,6 +92,14 @@ void DM_Motor_ParseFeedback(FDCAN_HandleTypeDef *hfdcan, uint32_t can_id, uint8_
 
 // 获取电机数据指针
 DM_Motor_t* DM_Motor_Get(uint8_t index);
+
+/* PVT 实际发送回读（索引 = CAN ID - 1；J4 为索引3）。
+   pos 是直接进入帧的 float，vel/cur 是乘100/10000后的原始 u16。 */
+extern volatile float    dm_pvt_tx_pos[DM_MOTOR_NUM];
+extern volatile uint16_t dm_pvt_tx_vel_raw[DM_MOTOR_NUM];
+extern volatile uint16_t dm_pvt_tx_cur_raw[DM_MOTOR_NUM];
+extern volatile uint32_t dm_pvt_tx_ok[DM_MOTOR_NUM];
+extern volatile uint8_t  dm_pvt_tx_frame[DM_MOTOR_NUM][8];
 // 导出全局电机数组，让所有文件和 Keil Watch 都能直接识别结构体
 extern DM_Motor_t dm_motors[DM_MOTOR_NUM];
 #endif

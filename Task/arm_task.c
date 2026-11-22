@@ -31,6 +31,9 @@ void Arm_Task(void *argument)
  * 控制环心跳停 500ms（且不在 Flash 窗口内）= 挂死：先失能全部电机再复位。 */
 void Mon_Task(void *argument)
 {
+    /* 调试时冻结 IWDG（H723 的 IWDG 在 APB4FZ1）：不冻结的话停在断点上 6s 就被复位 */
+    __HAL_DBGMCU_FREEZE_IWDG1();
+
     /* 工程没带 HAL 的 iwdg 驱动，直接操作寄存器：
        LSI≈32kHz，/64 = 500Hz，RLR=3000 → 6s 超时；启动后无法关闭。 */
     IWDG1->KR  = 0x5555u;              /* 解锁 PR/RLR */

@@ -21,9 +21,8 @@
 #include "main.h"
 #include "stm32h7xx_it.h"
 /* Private includes ----------------------------------------------------------*/
-/* 故障入口：先失能全部电机再系统复位（定义在 Modules/arm.c） */
-extern void Arm_EmergencyStopAndReset(void);
 /* USER CODE BEGIN Includes */
+#include "arm.h"   /* Arm_EmergencyStopAndReset() 的正式原型，禁止隐式声明 */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/

@@ -90,10 +90,7 @@ void MX_FDCAN2_Init(void)
   hfdcan2.Instance = FDCAN2;
   hfdcan2.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
   hfdcan2.Init.Mode = FDCAN_MODE_NORMAL;
-  /* J4/J5/J6/夹爪挪到 CAN2 后，这条线上跑的是 500Hz 控制帧：
-     和 CAN1 一样打开自动重传，否则仲裁失败/出错就直接丢帧不补。
-     注意：用 CubeMX 重新生成代码会把这行改回 DISABLE，需要在 .ioc 里同步。 */
-  hfdcan2.Init.AutoRetransmission = ENABLE;
+  hfdcan2.Init.AutoRetransmission = DISABLE;
   hfdcan2.Init.TransmitPause = DISABLE;
   hfdcan2.Init.ProtocolException = DISABLE;
   hfdcan2.Init.NominalPrescaler = 10;

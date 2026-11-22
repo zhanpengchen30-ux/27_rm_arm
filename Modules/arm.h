@@ -20,6 +20,15 @@
 extern volatile float g_grip_open;
 extern volatile float g_grip_close;
 extern volatile float g_grip_step;   /* 每个夹爪下发周期(10ms)的最大步进(rad) */
+extern volatile float g_grip_max_lag;/* 目标超前实测位置的上限(rad)，同时决定开合速度与夹持力 */
+extern volatile float g_grip_vel_max;/* 夹爪 PVT 速度字段上限(rad/s)，默认 6，可实时改 */
+
+/* 运行时方向修正：默认全 +1，等于只用编译期 ARM_DIR；某轴反了就写 -1，立刻生效。 */
+extern volatile int8_t g_dir_sign[ARM_JOINT_NUM];
+
+/* 各轴 PVT 电流前馈（不是限流）：默认 0.7。承重轴托不住/手能推得动就往上加，
+   1.2 是历史上的"够托举"值，1.8 触发过流保护；上限 2.0 由 SaneF 兜底。 */
+extern volatile float g_cur_ff[ARM_JOINT_NUM];
 
 /* 夹爪电流限值：**额定电流的标幺值**，不是安培（PVT 帧内部 ×10000，上限 1.0）。
    4310 额定 2.5A，所以 0.9 ≈ 2.25A。夹不紧往上调，但别超过 1.0。 */
@@ -48,7 +57,9 @@ extern volatile float    g_teach_speed;   /* 回放倍速，允许0.2~2.0，1.0�
 extern volatile float   g_slew_max_rad_s;   /* 跟随速度上限，默认3.0(=旧 ARM_MAX_STEP) */
 extern volatile float   g_decel_rad_s2;     /* 减速带加速度，默认20 */
 extern volatile uint8_t g_decel_en;         /* 0=旧行为(匀速怼+瞬间钉住) 1=开减速带 */
-extern volatile float   g_trk_err_peak[6];  /* 实测-指令 峰值跟踪误差(rad)；写0清零后重测 */
+extern volatile float   g_trk_vel_gain;     /* vmag 追赶增益：vmag += g*|实测-指令|，0=旧行为 */
+extern volatile float   g_trk_err_peak[6];  /* 实测-指令 峰值跟踪误差(rad)；写0清零后重测（伺服误差） */
+extern volatile float   g_lag_err_peak[6];  /* 主手期望-实测 峰值滞后(rad)；写0清零后重测（总滞后） */
 
 // Zigbee接收帧格式 (19字节，2026-11-09 四键协议)
 // 0xAB + 6*int16(0.001rad) + active + action + event_id + seq + crc8 + 0x55
@@ -181,7 +192,11 @@ typedef struct
     uint8_t state, home, slot, teach;
     uint8_t connected, active, q_off;
     uint8_t deploy_ok, stow_ok, snap_ok;
-    uint8_t m_err_mask, m_err, fb_mask;
+    uint8_t m_err_mask, m_err, fb_mask, lock_mask;
+    uint16_t lock_recover;
+    float    j4_tx_pos;
+    uint16_t j4_tx_vel_raw, j4_tx_cur_raw;
+    uint32_t j4_tx_ok;
     uint8_t slot_err, home_err, slot_step, slot_occ, slot_v;
 } ArmDbg_t;
 

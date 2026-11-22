@@ -463,10 +463,16 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     __HAL_LINKDMA(uartHandle,hdmatx,hdma_usart10_tx);
 
     /* USART10 interrupt Init */
-    HAL_NVIC_SetPriority(USART10_IRQn, 2, 0);
+    HAL_NVIC_SetPriority(USART10_IRQn, 15, 0);
     HAL_NVIC_EnableIRQ(USART10_IRQn);
   /* USER CODE BEGIN USART10_MspInit 1 */
-
+    /* ZigBee 单字节中断接收(19字节/帧@115200)，原优先级15是最低，
+       被 FDCAN(5) 等高频中断反复抢占导致 RXNE 溢出(ORE)、整帧CRC失败、
+       seq 跳号(zb_seq_lost≈11/s)，拉近主从30cm无改善即为此因。
+       回调 Arm_Zigbee_ParseByte 不调用 FreeRTOS API，可安全置于
+       configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY(5) 之上。
+       提到 4 保证每字节及时取走。CubeMX 重新生成会恢复15，此处USER CODE覆盖。 */
+    HAL_NVIC_SetPriority(USART10_IRQn, 4, 0);
   /* USER CODE END USART10_MspInit 1 */
   }
 }

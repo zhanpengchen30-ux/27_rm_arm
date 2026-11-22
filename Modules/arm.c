@@ -5,14 +5,29 @@
 #include "usart.h"
 #include "bsp_dr16.h"
 #include "dm_motor.h"
+#include "dm_fdcan.h"
 #include "bsp_can.h"
 #include "cmsis_os2.h"
+
+/* 编译时间戳：Watch 里看这个字符串就知道板上跑的是哪次编译的固件。
+   const 放 Flash（RO），不动 RAM 地址；volatile + Arm_Init 里读一次，
+   否则链接器会把没人引用的字符串裁掉。 */
+const volatile char g_fw_build[] = __DATE__ " " __TIME__;
 
 static uint8_t zigbee_rx_byte;
 Arm_t arm;
 volatile ArmDbg_t g_arm_dbg;   /* Watch 汇总：六轴角度/指令/目标 + 状态位，平铺不折叠 */
 static uint8_t zigbee_buf[32];
 static uint8_t zigbee_idx = 0;
+/* 每个关节是否已经用“新鲜反馈”建立了中档保持目标。
+   0 时绝不能拿 arm_lock_pos 的静态 0 当目标发 PVT，否则反馈晚到的关节
+   会被命令到绝对 0 位。逐轴锁存，允许各关节在不同节拍就绪。 */
+static uint8_t arm_lock_mask = 0;
+/* 中档目标与实测偏差超过该值时，认为锁存点失效（异常首帧、掉线后被搬动、
+   模式切换等），直接按当前实测重锁，绝不继续追远处目标。20° 大于正常
+   保持误差，又能阻止 J4 被一个错误目标拉转数圈。 */
+#define ARM_LOCK_MAX_ERR_RAD 0.35f
+static uint32_t arm_lock_recover_cnt = 0;
 
 #define JOINT_MAX_VEL       4.0f
 
@@ -39,16 +54,22 @@ static uint8_t zigbee_idx = 0;
 /* PVT velocity field (u16) is the speed the inner loop may use to reach the
    position target. Feeding 0 at standstill removes its ability to correct a
    gravity sag (J2 slowly drops), feeding a constant 4 makes it ring.
-   Use the commanded speed with a floor that still allows holding. */
-#define ARM_VEL_MAX_RAD_S   4.0f
+   Use the commanded speed with a floor that still allows holding.
+   关节的 vmag 上限用 CAP；夹爪的 vel 上限用运行时 g_grip_vel_max。 */
 #define ARM_VEL_MIN_RAD_S   0.4f
+#define ARM_VEL_CAP_RAD_S   6.0f
 
 /* 关节 PVT 发帧分频：控制环仍然每 2ms 跑（所有按"拍"计数的判据、限幅、
    到位保持、示教采样语义都不变），只把发帧降到 1/ARM_TX_DECIMATE。
-   6 轴 500Hz + 1:1 回执 = 6200 帧/s ≈ 80% 负载 → 250Hz 后 3200 帧/s ≈ 42%，
-   回到 CiA 的 50% 建议线内。想恢复原行为只改这一个宏为 1u。
-   同拍只发一半轴（奇偶错峰），突发长度和单帧排队延迟也一起减半。 */
+   只要 FD 5M 打开，回执就走 FD 5M（≈55us/帧），命令即使仍发 classic：
+   6 轴 500Hz + 夹爪 100Hz ≈ 3100 帧/s × 111us ≈ 34%，回执同量 ≈ 17%，
+   合计约 50%，TX FIFO 32 深足够。全 classic（FD 全关）时回执也要 111us/帧，
+   500Hz 会到 80%，才必须分频 2。开关都在 dm_fdcan.h，别在别处单独改这个数。 */
+#if DM_CANFD_5M_ENABLE
+#define ARM_TX_DECIMATE     1u
+#else
 #define ARM_TX_DECIMATE     2u
+#endif
 #define ARM_TX_INTERVAL_S   ((float)ARM_TX_DECIMATE * ARM_CTRL_PERIOD_S)
 
 /* 速度字段必须按"真正发帧之间"的位移/时间算：按拍的 cmd_smooth 差值算，
@@ -89,11 +110,12 @@ static void Slot_FlashLoad(void);                  /* 矿位点位表，上电�
  * ======================================================================== */
 
 /* 工作位：用户实测姿态（Keil Watch 抄录 dm_motors[0..5].position，单位 rad）。
-   2026-11-13 用户要求 J6 再转 180°（-2.7750 → 0.3665），与放矿点手腕同侧。
+   2026-11-19 按用户指定截图重录；J4/J6 参数与零点调整后重新确定。
+   J1=+0.0494013 距软件上限 0.05 仅约 0.0006 rad，自动运动时需重点检查限幅。
    仍可在现场用 g_deploy_pose_cmd=1 重录覆盖；这里只是出厂默认值。 */
 volatile float   g_deploy_pos[ARM_JOINT_NUM] = {
-    -0.0165939f, -0.8249407f, -0.9119177f,
-     0.2397575f, -0.4194326f,  0.3665491f
+     0.0494013f, -0.6017780f, -0.9260321f,
+    -0.9813461f, -0.5891886f,  0.2111464f
 };
 volatile uint8_t g_deploy_valid    = 1u;  /* 1=工作位已标定且合法 */
 volatile uint8_t g_deploy_pose_cmd = 0u;  /* Watch：1=录当前姿态为工作位 2=清除标定 */
@@ -191,7 +213,23 @@ volatile uint32_t zb_bad_tail   = 0;
 volatile uint32_t zb_resync     = 0;
 volatile uint32_t zb_restart    = 0;
 volatile uint32_t zb_gap_max_ms = 0;
+/* 帧间隔分布：主手 10ms 一帧，所以 >20ms 已至少丢 1 帧，
+   >100ms 超过 ARM_GAP_CATCHUP_MS 会触发追位，>500ms 进 reclutch。
+   三个计数与 zb_gap_max_ms 一起读：max 只说"最坏多长"，这三个说"各发生几次"。
+   Watch 里可直接写 0 清零重测。 */
+volatile uint32_t zb_gap20_cnt  = 0;
+volatile uint32_t zb_gap50_cnt  = 0;
+volatile uint32_t zb_gap100_cnt = 0;
 volatile uint32_t zb_reclutch_cnt = 0;
+
+/* FDCAN1 健康快照（每 100ms 采一次）：冻结发生后先看这两个，判断是总线错误
+   挂死还是软件根本没发。ECR 原始值 TEC=bit0~7、REC=bit8~14（>96 警告、255 bus-off）；
+   PSR 原始值 bit5=EP 被动错误、bit6=EW 警告、bit7=BO 总线关闭。
+   正常跑应长期为 0；g_can_recover_cnt = 自恢复看门狗触发次数。 */
+volatile uint32_t g_can_ecr_dbg = 0;
+volatile uint32_t g_can_psr_dbg = 0;
+volatile uint32_t g_can_recover_cnt = 0;
+extern volatile uint32_t can_tx_fifo_full;   /* dm_motor.c：TX FIFO 满丢帧次数 */
 
 /* ---- 帧格式（与主手 Apps/zigbee.c 严格一致）----------------------------
    19 字节：AB | q0..q5 (12B) | active | action | event_id | seq | crc8 | 55
@@ -254,11 +292,22 @@ volatile uint32_t zb_jump_reject = 0;
    The master sends every 10ms while the loop runs every 2ms. Applying a whole
    frame's delta inside one 2ms tick gives a ~5rad/s burst followed by ~8ms of
    standstill - the arm buzzes at 100Hz. Spread each frame's delta over
-   ARM_INTERP_TICKS ticks so the command becomes a continuous ramp. */
+   ARM_INTERP_TICKS ticks so the command becomes a continuous ramp.
+   无线 100Hz：主手 ZIGBEE_TX_PERIOD_MS=10ms，这里取 5 tick ×2ms = 10ms。
+   （有线 500Hz 对应 1；50Hz 无线对应 10。改这个必须和主手发帧周期一起改。）
+   注意：主手环若因 UART 占用掉帧，斜坡会提前跑完，靠 COAST 滑行补上。 */
 #define ARM_INTERP_TICKS 5u
+/* 插值窗口 N tick 正好等于一帧周期(当前 5 tick × 2ms = 10ms @100Hz 无线)，
+   丢帧时斜坡会提前跑完然后冻住：
+   实测链路丢帧 ~27%，原来每丢一帧命令停 12ms、下一帧再双倍速补，这是"抖"
+   的直接来源。斜坡跑完而新帧未到时，按上一拍步长线性衰减再滑行一帧周期；
+   新帧一到立即清零重算，不会累积误差。
+   注意：改主手发帧周期时本宏与 ARM_INTERP_TICKS 必须一起改。 */
+#define ARM_INTERP_COAST_TICKS 5u
 static float    arm_interp_target[ARM_JOINT_NUM] = {0};
 static float    arm_interp_step[ARM_JOINT_NUM]   = {0};
 static uint32_t arm_interp_left = 0;
+static uint32_t arm_interp_coast = 0;
 static uint32_t arm_last_frame_cnt = 0;
 
 static void Arm_InterpResetJoint(int i)
@@ -270,22 +319,41 @@ static void Arm_InterpResetJoint(int i)
 static void Arm_InterpResetAll(void)
 {
     for(int i = 0; i < ARM_JOINT_NUM; i++) Arm_InterpResetJoint(i);
-    arm_interp_left = 0;
+    arm_interp_left  = 0;
+    arm_interp_coast = 0;
 }
 
 /* 主从方向：-1 表示该轴主手增量取反后再映射到从手。
-   2026-11-09 实测 J6 方向相反，第 6 项由 +1 改为 -1。 */
+   历史实测：2026-11-22 12:28 相关系数 J1 +0.83 / J2 -0.88 / J3 -0.79 /
+   J4 +0.94 / J5 -0.91 / J6 +0.92；14:09 把 J4、J5 翻反后 J4 掉到 -0.42、
+   J5 变 +0.17，跟随明显变差。
+   2026-11-22 现场最终确认：J6 = -1（用户两次反馈 J6 反了，以现场为准，
+   覆盖 12:28 的相关系数记录）；J4 = -1（19:20 改）。
+   方向以现场手动推主手看同向为准；若需临时翻转，用 g_dir_sign 立即生效、无需重烧。 */
 static const float ARM_DIR[ARM_JOINT_NUM] = {
-    1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f
+    1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f
 };
+
+/* 运行时方向修正：默认全 +1 = 只用上面的编译期表。
+   现场再发现某轴反了，在 Watch 里把对应项写 -1 立刻生效，不用重烧；
+   确认后把编译期 ARM_DIR 改掉、这里恢复 +1，避免下次上电忘了。
+   只取符号：写 -1 为反、其余一律按 +1。 */
+volatile int8_t g_dir_sign[ARM_JOINT_NUM] = {1, 1, 1, 1, 1, 1};
+
+static float Arm_Dir(uint8_t i)
+{
+    return ARM_DIR[i] * (float)g_dir_sign[i];
+}
 
 static const float ARM_Q_MIN[ARM_JOINT_NUM] = { -3.10f, -2.80f,  -2.40f, -10.0f, -10.0f, -10.0f};
 static const float ARM_Q_MAX[ARM_JOINT_NUM] = {  0.05f,  0.05f,  0.23f,  10.0f,  10.0f,  10.0f};
 
-/* 电流限值：额定电流的标幺值（PVT 帧内 ×10000，范围 0~10000），不是安培。
-   0.7 = 额定的 70%。 */
-static const float ARM_CUR_LIMIT[ARM_JOINT_NUM] = {
-    0.7f,  0.7f,  0.7f,  0.7f,  0.7f,  0.7f
+/* 各轴 PVT 第 3 字段（电流/力矩前馈），不是限流。
+   0.7 全轴时承重轴托不住、手能推得动（2026-10-23 7867d33 有记录）；
+   1.8 触发过流保护（aa3c4ef 改回 0.7）。做成运行时变量现场试：
+   J2 先从 0.7 提到 1.2，不报过流再往上；上限 2.0 在 SaneF 里。 */
+volatile float g_cur_ff[ARM_JOINT_NUM] = {
+    0.7f, 0.7f, 0.7f, 0.7f, 0.7f, 0.7f
 };
 
 static float Arm_ClampJoint(int i, float v)
@@ -305,8 +373,13 @@ volatile float g_grip_close = 2.10f;
 #define GRIP_TX_PERIOD_S    0.010f
 
 /* 每拍最大步进(rad)，10ms 一拍 ⇒ 数值 ×100 即 rad/s。
-   0.15 已到 GRIP_MAX_LAG 上限，再大也不会更快。 */
+   真正卡住开合速度的是 g_grip_max_lag：实测开合 3.8 rad 用 1.4 s，
+   期间超前稳定顶在 0.15 限幅上，再加大步进也不会更快。 */
 volatile float g_grip_step  = 0.15f;
+
+/* 夹爪 PVT 的速度字段上限(rad/s)。实测 4 时全行程 1.2 s；提到 6 还能再快，
+   运行时可改。再往上主要受电流限幅和机械阻力限制，时间不再降就别硬加。 */
+volatile float g_grip_vel_max = 6.0f;
 
 /* 夹爪电流限值：同为标幺值，上限 1.0（= 满额定）。 */
 volatile float g_grip_cur = 0.9f;
@@ -316,8 +389,10 @@ volatile float g_grip_ore_min = 0.0f;
 volatile float g_grip_ore_max = 0.0f;
 
 /* 目标相对实测位置的最大超前(rad)。夹住物体后目标走不动，
-   钳住误差即钳住夹持力，避免长时间堵转升温。 */
-#define GRIP_MAX_LAG        0.15f
+   钳住误差即钳住夹持力，避免长时间堵转升温。
+   这个值同时是开合速度的上限（内环靠超前量加速），运行时可在
+   EmberProbe/Watch 里改：0.25 约快 1.5 倍，别超过 0.4 太多（夹持力同步变大）。 */
+volatile float g_grip_max_lag = 0.25f;
 
 /* 首帧反馈到达时把目标对齐到实际位置，避免从 0 起算导致上电猛甩。 */
 static uint8_t arm_grip_synced = 0;
@@ -378,6 +453,9 @@ static void Arm_DecodeFrame(uint8_t active, uint8_t action, uint8_t event_id, ui
     {
         uint32_t gap = now - arm.last_rx_tick;
         if(gap > zb_gap_max_ms) zb_gap_max_ms = gap;
+        if(gap > 20u)  zb_gap20_cnt++;
+        if(gap > 50u)  zb_gap50_cnt++;
+        if(gap > ARM_GAP_CATCHUP_MS) zb_gap100_cnt++;
         if(gap > ARM_GAP_RECLUTCH_MS)
         {
             arm_reclutch_req = 1;
@@ -516,6 +594,8 @@ static void Teach_FlashLoad(void);   /* 定义在示教函数段后面 */
 
 void Arm_Init(void)
 {
+    (void)g_fw_build[0];   /* 保活编译时间戳，见定义处 */
+
     DM_Motor_Init();
 
     __HAL_RCC_GPIOC_CLK_ENABLE();
@@ -535,6 +615,8 @@ void Arm_Init(void)
     arm_q_offset_mask = 0;
     arm_catchup_mask = 0;
     arm_reclutch_req = 0;
+    arm_lock_mask = 0;
+    arm_lock_recover_cnt = 0;
 
     HAL_UART_Receive_IT(&huart10, &zigbee_rx_byte, 1);
 
@@ -551,7 +633,7 @@ static uint8_t Arm_CaptureFollowOffset(void)
         uint8_t bit = (uint8_t)(1u << i);
         DM_Motor_t *m = DM_Motor_Get(i);
         if((arm_q_offset_mask & bit) || m == NULL || m->rx_cnt == 0) continue;
-        arm.q_offset[i]   = ARM_DIR[i] * arm.target_joint[i] - m->position;
+        arm.q_offset[i]   = Arm_Dir(i) * arm.target_joint[i] - m->position;
         arm.cmd_smooth[i] = m->position;
         arm_q_offset_mask |= bit;
     }
@@ -602,6 +684,8 @@ static void Arm_UpdateState(void)
     {
         if(arm.last_state == ARM_STATE_DISABLED && arm.state != ARM_STATE_DISABLED)
         {
+            /* 重新使能必须重新建立每轴保持点；旧锁存不可跨失能复用 */
+            arm_lock_mask = 0;
             /* 途中拨回下档即中止；已使能的由下一拍 DISABLED 分支统一失能 */
             for(int i = 0; i < ARM_MOTOR_NUM; i++)
             {
@@ -622,6 +706,7 @@ static void Arm_UpdateState(void)
                         {
                             arm_lock_pos[i]   = m->position;
                             arm.cmd_smooth[i] = m->position;
+                            arm_lock_mask |= (uint8_t)(1u << i);
                         }
                         osDelay(1);
                     }
@@ -630,6 +715,8 @@ static void Arm_UpdateState(void)
         }
         else if(arm.state == ARM_STATE_LOCKED)
         {
+            /* 每次进入锁定态都重新捕获；没新鲜反馈的轴保持未锁存，后续逐轴补 */
+            arm_lock_mask = 0;
             for(int i = 0; i < ARM_JOINT_NUM; i++)
             {
                 DM_Motor_t *m = DM_Motor_Get(i);
@@ -637,6 +724,7 @@ static void Arm_UpdateState(void)
                 {
                     arm_lock_pos[i]   = m->position;
                     arm.cmd_smooth[i] = m->position;
+                    arm_lock_mask |= (uint8_t)(1u << i);
                 }
             }
             arm.q_offset_valid = 0;
@@ -645,6 +733,7 @@ static void Arm_UpdateState(void)
         }
         else if(arm.state == ARM_STATE_DISABLED)
         {
+            arm_lock_mask = 0;
             for(int i = 0; i < ARM_MOTOR_NUM; i++)
             {
                 DM_Motor_t *m = DM_Motor_Get(i);
@@ -679,11 +768,17 @@ static void Arm_UpdateState(void)
  * 惯性，表现为过冲 + 回抽。开减速带后按剩余距离提前收速 v<=sqrt(2*a*d)。
  * g_decel_en=0 时逐拍结果与改动前完全一致；g_slew_max_rad_s 默认 3.0 也等于
  * 原来写死的 ARM_MAX_STEP，两个开关都能单独退回旧行为做对照。
+ * 2026-11-22：默认上限 3.0 -> 4.0（提高跟随速度）；SaneF 允许 0.1~6.0。
  * ======================================================================== */
-volatile float   g_slew_max_rad_s = 3.0f;                /* 跟随速度上限(rad/s) */
+volatile float   g_slew_max_rad_s = 4.0f;                /* 跟随速度上限(rad/s) */
 volatile float   g_decel_rad_s2   = 20.0f;               /* 减速带加速度(rad/s^2) */
 volatile uint8_t g_decel_en       = 0;                   /* 0=旧行为 1=开减速带 */
-volatile float   g_trk_err_peak[ARM_JOINT_NUM] = {0};    /* 实测-指令峰值(rad)，写0清零 */
+volatile float   g_trk_vel_gain   = 0.0f;                /* vmag 追赶增益，0=旧行为 */
+/* 关节 vmag 的下限(rad/s)：静止时仍给内环一点速度余量，防止重力缓慢下沉。
+   怀疑静止抖动来自这个常值速度时，可在 Watch 里往 0.1 试。 */
+volatile float   g_trk_vel_min    = 0.4f;
+volatile float   g_trk_err_peak[ARM_JOINT_NUM] = {0};    /* 实测-指令峰值(rad)，写0清零：伺服误差 */
+volatile float   g_lag_err_peak[ARM_JOINT_NUM] = {0};    /* 主手期望-实测峰值(rad)，写0清零：总滞后 */
 
 static float Arm_RateLimit(float target, float current, float max_step)
 {
@@ -1349,7 +1444,7 @@ static uint8_t Arm_GripHoldingOre(void)
     DM_Motor_t *gm = DM_Motor_Get(ARM_JOINT_NUM);
     if(gm == NULL || !Arm_FbFresh(gm) || gm->error != 1u) return 0u;
     if(fabsf(gm->velocity) > 0.08f) return 0u;
-    if(fabsf(arm.target_gripper - gm->position) > (GRIP_MAX_LAG + 0.03f)) return 0u;
+    if(fabsf(arm.target_gripper - gm->position) > (g_grip_max_lag + 0.03f)) return 0u;
     if(Arm_GripWindowValid())
         return (gm->position >= g_grip_ore_min && gm->position <= g_grip_ore_max) ? 1u : 0u;
     return g_slot_force ? 1u : 0u;
@@ -2313,6 +2408,16 @@ static void Arm_DbgUpdate(void)
         float t = arm.target_joint[i];
         float e = fabsf(q - c);
 
+        /* 只在纯跟随时算"主手要的 - 实际到的"，deploy/示教/矿位不掺进来 */
+        if(arm.state == ARM_STATE_FOLLOWING && arm.connected && arm.active &&
+           g_home_state == ARM_HOME_FOLLOW && (arm_q_offset_mask & (uint8_t)(1u << i)) &&
+           g_deploy_state == 0u && g_teach_state == 0u && g_slot_state == ARM_SLOT_ST_IDLE)
+        {
+            float raw = Arm_Dir(i) * arm.target_joint[i] - arm.q_offset[i];
+            float lag = fabsf(raw - q);
+            if(lag > g_lag_err_peak[i]) g_lag_err_peak[i] = lag;
+        }
+
         if(e > err_max) err_max = e;
         if(m != NULL && Arm_FbFresh(m)) fb |= (uint8_t)(1u << i);
         if(m != NULL && m->error != 1u)
@@ -2353,6 +2458,12 @@ static void Arm_DbgUpdate(void)
     d->m_err_mask = mask;
     d->m_err      = code;
     d->fb_mask    = fb;
+    d->lock_mask  = arm_lock_mask;
+    d->lock_recover = (arm_lock_recover_cnt > 0xFFFFu) ? 0xFFFFu : (uint16_t)arm_lock_recover_cnt;
+    d->j4_tx_pos     = dm_pvt_tx_pos[3];
+    d->j4_tx_vel_raw = dm_pvt_tx_vel_raw[3];
+    d->j4_tx_cur_raw = dm_pvt_tx_cur_raw[3];
+    d->j4_tx_ok      = dm_pvt_tx_ok[3];
     d->slot_err   = g_slot_err;
     d->home_err   = g_home_err;
     d->slot_step  = g_slot_step;
@@ -2376,16 +2487,91 @@ void Arm_ControlLoop(void)
     Arm_SaneF(&g_grip_open,   -5.0f, 5.0f, -1.72f);
     Arm_SaneF(&g_grip_close,  -5.0f, 5.0f,  2.10f);
     Arm_SaneF(&g_grip_step,  0.001f, 1.0f,  0.15f);
+    Arm_SaneF(&g_grip_max_lag, 0.05f, 0.60f, 0.25f);
+    Arm_SaneF(&g_grip_vel_max, 0.5f, 12.0f, 6.0f);
     Arm_SaneF(&g_grip_cur,    0.0f,  1.0f,  0.9f);
     Arm_SaneF(&g_deploy_speed, 0.05f, 3.0f, 0.5f);
     Arm_SaneF(&g_teach_speed,  0.2f,  2.0f, 1.0f);
-    Arm_SaneF(&g_slew_max_rad_s, 0.1f,  6.0f,  3.0f);
+    Arm_SaneF(&g_slew_max_rad_s, 0.1f,  6.0f,  4.0f);
+    Arm_SaneF(&g_trk_vel_gain,   0.0f, 20.0f,  0.0f);
+    Arm_SaneF(&g_trk_vel_min,    0.0f,  1.5f,  0.4f);
     Arm_SaneF(&g_decel_rad_s2,   1.0f, 80.0f, 20.0f);
+    for(int i = 0; i < ARM_JOINT_NUM; i++)
+        Arm_SaneF(&g_cur_ff[i], 0.0f, 2.0f, 0.7f);
+    /* 方向改了必须重新对零：否则旧 q_offset 按旧符号算，目标会跳 2 倍主手角。
+       清 mask 后下一拍各轴按当前位置重新捕获（cmd=pos，不会甩），代价是全体停一拍。 */
+    {
+        static int8_t dir_prev[ARM_JOINT_NUM] = {1, 1, 1, 1, 1, 1};
+        for(int i = 0; i < ARM_JOINT_NUM; i++)
+        {
+            g_dir_sign[i] = (g_dir_sign[i] < 0) ? -1 : 1;
+            if(g_dir_sign[i] != dir_prev[i])
+            {
+                dir_prev[i] = g_dir_sign[i];
+                arm_q_offset_mask = 0;
+                arm.q_offset_valid = 0;
+            }
+        }
+    }
 
     static uint32_t t_heal = 0;
     static uint8_t heal_enable_mask = 0;
     static uint32_t heal_enable_due[ARM_MOTOR_NUM] = {0};
+    static uint32_t arm_probe_ms[ARM_JOINT_NUM] = {0};
     uint32_t now = HAL_GetTick();
+
+    /* CAN 自恢复看门狗：全部关节反馈都断 >300ms，且这期间 TX FIFO 还在涨，
+       说明总线错误把发送挂死了（自动重传会一直重试，FIFO 永不排空，反馈也收不到）。
+       单根线/单台电机掉线时 FIFO 不会堵，所以不会误触发。
+       恢复 = 丢弃排队帧 → 停 → 起（重新走 bus-off 恢复序列）→ 重挂接收中断。 */
+    {
+        static uint32_t t_can = 0;
+        static uint32_t fifo_snap = 0;
+        static uint32_t stale_since = 0;
+        static uint8_t recovering = 0;
+
+        if((uint32_t)(now - t_can) >= 100u)
+        {
+            t_can = now;
+            g_can_ecr_dbg = hfdcan1.Instance->ECR;
+            g_can_psr_dbg = hfdcan1.Instance->PSR;
+
+            uint8_t all_stale = 1;
+            for(int i = 0; i < ARM_JOINT_NUM; i++)
+            {
+                DM_Motor_t *m = DM_Motor_Get(i);
+                if(m && m->rx_cnt > 0u && (uint32_t)(now - m->last_rx_tick) < 300u)
+                { all_stale = 0; break; }
+            }
+
+            uint32_t fifo_now = can_tx_fifo_full;
+            if(!all_stale || arm.state == ARM_STATE_DISABLED || g_scan_req)
+            {
+                stale_since = now;
+                fifo_snap = fifo_now;
+                recovering = 0;
+            }
+            else if(!recovering && (uint32_t)(now - stale_since) >= 300u && fifo_now != fifo_snap)
+            {
+                recovering = 1;
+                /* 取消 FIFO 里所有排队元素（此版 HAL 没有 FDCAN_TX_FIFO_QUEUE 宏，
+                   TXBCR 的每一位对应一个 FIFO 元素号，全 1 即全取消）。 */
+                HAL_FDCAN_AbortTxRequest(&hfdcan1, 0xFFFFFFFFu);
+                HAL_FDCAN_Stop(&hfdcan1);
+                HAL_FDCAN_Start(&hfdcan1);
+                HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
+                g_can_recover_cnt++;
+                fifo_snap = can_tx_fifo_full;
+            }
+            else if(recovering && (uint32_t)(now - stale_since) >= 1000u)
+            {
+                /* 恢复后 1s 仍全断：允许再试一次，别每 100ms 重启总线 */
+                recovering = 0;
+                stale_since = now;
+                fifo_snap = fifo_now;
+            }
+        }
+    }
 
     /* 1s jitter window: publish peak-to-peak, then restart the window */
     {
@@ -2525,12 +2711,19 @@ void Arm_ControlLoop(void)
         __enable_irq();
         for(int i = 0; i < ARM_JOINT_NUM; i++)
             arm_interp_step[i] = (tgt[i] - arm_interp_target[i]) / (float)ARM_INTERP_TICKS;
-        arm_interp_left = ARM_INTERP_TICKS;
+        arm_interp_left  = ARM_INTERP_TICKS;
+        arm_interp_coast = 0;
     }
     if(arm_interp_left > 0)
     {
         for(int i = 0; i < ARM_JOINT_NUM; i++) arm_interp_target[i] += arm_interp_step[i];
-        arm_interp_left--;
+        if(--arm_interp_left == 0u) arm_interp_coast = ARM_INTERP_COAST_TICKS;
+    }
+    else if(arm_interp_coast > 0u)
+    {
+        float k = (float)arm_interp_coast / (float)ARM_INTERP_COAST_TICKS;
+        for(int i = 0; i < ARM_JOINT_NUM; i++) arm_interp_target[i] += arm_interp_step[i] * k;
+        arm_interp_coast--;
     }
 
     /* 抽臂/取矿生效条件：遥控器上档 + 主手在线 + 命令码 1/2（3 是循环脉冲，另走 Arm_CycleTick）。
@@ -2594,9 +2787,43 @@ void Arm_ControlLoop(void)
         if(m == NULL || m->hfdcan == NULL) continue;
 
         uint8_t joint_bit = (uint8_t)(1u << i);
-        /* 反馈超时的关节本拍跳过：不算目标、不发 PVT，
-           电机自己保持/进通讯丢失保护，比按冻结值或 0 位姿灌电流安全 */
-        if(!Arm_FbFresh(m)) continue;
+        /* 反馈超时的关节本拍不发 PVT：电机自己保持，比按冻结值或不存在的
+           0 位姿灌电流安全。但达妙电机是"收到一帧才回一帧"，跳过发送就等于
+           把该轴永久静默 —— 只要 stale 超过 50ms，之后永远收不到新反馈。
+           2026-11-22 14:09 整臂 43.5s、J6 49.8s 僵死都是这个自锁。
+           掉线期间每 50ms 补一帧使能帧探活（不含位置，不会让电机乱动），
+           反馈一到下一拍就恢复正常发送。 */
+        if(!Arm_FbFresh(m))
+        {
+            arm_lock_mask &= (uint8_t)~joint_bit;
+            if(arm.state != ARM_STATE_DISABLED && !g_scan_req &&
+               (uint32_t)(now - arm_probe_ms[i]) >= 50u)
+            {
+                arm_probe_ms[i] = now;
+                Arm_SendCmd(m, i, DM_CMD_ENABLE);
+            }
+            continue;
+        }
+
+        /* 中档保持点必须由该轴自己的新鲜反馈建立。使能转态时若反馈尚未到，
+           arm_lock_pos 仍是静态 0；这里在反馈首次变新鲜的这一拍补锁存，
+           下一拍才允许发保持 PVT，绝不能被拉到绝对 0 位。
+           若已有锁存点但与实测相差过大，说明该目标已不可信：按当前实测重锁，
+           本拍不发 PVT。显著大于正常保持误差，避免错误首帧把关节拉转数圈。 */
+        if(arm.state == ARM_STATE_LOCKED)
+        {
+            float lock_err = fabsf(arm_lock_pos[i] - m->position);
+            if(!(arm_lock_mask & joint_bit) || lock_err > ARM_LOCK_MAX_ERR_RAD)
+            {
+                if(arm_lock_mask & joint_bit) arm_lock_recover_cnt++;
+                arm_lock_pos[i]    = m->position;
+                arm.cmd_smooth[i]  = m->position;
+                arm_last_tx_cmd[i] = m->position;
+                arm_last_tx_ms[i]  = now;
+                arm_lock_mask |= joint_bit;
+                continue;   /* 本拍只建立保持点，下一拍才允许发该轴 PVT */
+            }
+        }
         if(in_deploy && auto_fb_ok)
         {
             /* 走本机记录的电机绝对位置，与主手角度、q_offset 无关 */
@@ -2640,7 +2867,7 @@ void Arm_ControlLoop(void)
         {
             /* Capture each joint independently; one late motor must not leave
                the remaining joints running with an implicit zero offset. */
-            arm.q_offset[i]   = ARM_DIR[i] * arm.target_joint[i] - m->position;
+            arm.q_offset[i]   = Arm_Dir(i) * arm.target_joint[i] - m->position;
             arm.cmd_smooth[i] = m->position;
             arm_last_tx_cmd[i] = m->position;   /* no velocity kick at clutch */
             arm_last_tx_ms[i]  = now;
@@ -2656,7 +2883,7 @@ void Arm_ControlLoop(void)
         {
             if(arm.connected)
             {
-                float raw_target = ARM_DIR[i] * arm_interp_target[i] - arm.q_offset[i];
+                float raw_target = Arm_Dir(i) * arm_interp_target[i] - arm.q_offset[i];
                 float clamped    = Arm_ClampJoint(i, raw_target);
 
                 /* 越限：从手停在限位，q_offset 一律不改。
@@ -2695,10 +2922,9 @@ void Arm_ControlLoop(void)
                 arm.cmd_smooth[i] = Arm_RateLimit(clamped, arm.cmd_smooth[i], max_step);
             }
         }
-        else if(arm.state != ARM_STATE_FOLLOWING)
+        else if(arm.state == ARM_STATE_LOCKED && (arm_lock_mask & joint_bit))
         {
-            /* While following, a temporary link/enable loss must hold the
-               last commanded pose; arm_lock_pos can be an older clutch pose. */
+            /* 只允许使用已由新鲜反馈建立的保持点；未锁存时本拍绝不发 PVT */
             arm.cmd_smooth[i] = arm_lock_pos[i];
         }
 
@@ -2725,11 +2951,15 @@ void Arm_ControlLoop(void)
             arm_last_tx_cmd[i] = arm.cmd_smooth[i];
         }
         float vmag = fabsf(arm.cmd_smooth[i] - arm_last_tx_cmd[i]) * 1000.0f / (float)dt_ms;
-        if(vmag < ARM_VEL_MIN_RAD_S) vmag = ARM_VEL_MIN_RAD_S;
-        if(vmag > ARM_VEL_MAX_RAD_S) vmag = ARM_VEL_MAX_RAD_S;
+        if(vmag < g_trk_vel_min) vmag = g_trk_vel_min;
+        /* 纯按指令速度给 vmag 时它刚好等于手速，落后多少都追不回来；
+           叠加"落后量×增益"后，手停下来那一刻内环还有速度余量把差距收掉。
+           g_trk_vel_gain=0 时逐位等于旧行为。 */
+        vmag += g_trk_vel_gain * fabsf(m->position - arm.cmd_smooth[i]);
+        if(vmag > ARM_VEL_CAP_RAD_S) vmag = ARM_VEL_CAP_RAD_S;
 
         DM_Motor_PVT_Control(m->hfdcan, m->can_id,
-                             arm.cmd_smooth[i], vmag, ARM_CUR_LIMIT[i]);
+                             arm.cmd_smooth[i], vmag, g_cur_ff[i]);
         arm_last_tx_cmd[i] = arm.cmd_smooth[i];
         arm_last_tx_ms[i]  = now;
 
@@ -2817,12 +3047,12 @@ void Arm_ControlLoop(void)
 
                 /* 限幅跟踪误差 = 限幅夹持力，同时防止堵转满电流死顶 */
                 float lag = arm.target_gripper - gm->position;
-                if(lag >  GRIP_MAX_LAG) arm.target_gripper = gm->position + GRIP_MAX_LAG;
-                if(lag < -GRIP_MAX_LAG) arm.target_gripper = gm->position - GRIP_MAX_LAG;
+                if(lag >  g_grip_max_lag) arm.target_gripper = gm->position + g_grip_max_lag;
+                if(lag < -g_grip_max_lag) arm.target_gripper = gm->position - g_grip_max_lag;
             }
 
             float gvel = g_grip_step / GRIP_TX_PERIOD_S;
-            if(gvel > ARM_VEL_MAX_RAD_S) gvel = ARM_VEL_MAX_RAD_S;
+            if(gvel > g_grip_vel_max) gvel = g_grip_vel_max;
             if(gvel < ARM_VEL_MIN_RAD_S) gvel = ARM_VEL_MIN_RAD_S;
 
             DM_Motor_PVT_Control(gm->hfdcan, gm->can_id,

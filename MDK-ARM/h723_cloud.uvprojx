@@ -1089,6 +1089,11 @@
               <FileType>1</FileType>
               <FilePath>..\Devices\dm_motor.c</FilePath>
             </File>
+            <File>
+              <FileName>dm_fdcan.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Devices\dm_fdcan.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

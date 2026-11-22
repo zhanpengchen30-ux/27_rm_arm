@@ -1,5 +1,6 @@
 #include "bsp_can.h"
 #include "dm_motor.h"
+#include "dm_fdcan.h"
 #include "string.h"
 #include "math.h"
 
@@ -56,7 +57,9 @@ void BSP_FDCAN_Config(void)
     sFilterConfig.FilterID1 = 0x0000; //ID
     sFilterConfig.FilterID2 = 0x0000; // Mask=0, 接收所有
 
-    //FDCAN1
+    //FDCAN1：先切成 FD（仲裁 1M / 数据域 5M），再配过滤器。
+    //重新初始化会清掉过滤器，所以这两步的先后不能对调。
+    DM_FDCAN_ConfigureFD(&hfdcan1);
     HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig);
     HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT, FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE);
     HAL_FDCAN_Start(&hfdcan1);
@@ -113,7 +116,9 @@ void DJI_Motor_Send_Command(FDCAN_HandleTypeDef* hfdcan, uint32_t std_id, int16_
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 {
     FDCAN_RxHeaderTypeDef rx_header;
-    uint8_t rx_data[8];
+    /* FD 帧最长 64 字节，HAL_FDCAN_GetRxMessage 按 DLC 拷这么多。
+       缓冲区必须按 64 开，否则总线上出现长帧会直接踩栈。 */
+    uint8_t rx_data[64];
 
     // CAN RX interrupt: push frame into queue
     if((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) != RESET)

@@ -1,0 +1,50 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "EmberProbe: 复位调试 + 波形 (CMSIS-DAP)",
+      "type": "emberprobe",
+      "request": "launch",
+      "executable": "${workspaceFolder}/MDK-ARM/h723_cloud/h723_cloud.axf",
+      "runToEntryPoint": "main"
+    },
+    {
+      "name": "Cortex Debug (CMSIS-DAP / OpenOCD, STM32H723)",
+      "type": "cortex-debug",
+      "request": "launch",
+      "servertype": "openocd",
+      "cwd": "${workspaceFolder}",
+      "executable": "${workspaceFolder}/MDK-ARM/h723_cloud/h723_cloud.axf",
+      "device": "STM32H723ZG",
+      "configFiles": [
+        "interface/cmsis-dap.cfg",
+        "target/stm32h7x.cfg"
+      ],
+      "openOCDLaunchCommands": [
+        "adapter speed 1800"
+      ],
+      "gdbPath": "arm-none-eabi-gdb",
+      "svdFile": "D:/DevEnv/ST/STM32CubeCLT_1.18.0/STMicroelectronics_CMSIS_SVD/STM32H723.svd",
+      "runToEntryPoint": "main",
+      "postLaunchCommands": [
+        "monitor reset halt"
+      ]
+    },
+    {
+      "name": "Cortex Debug (ST-Link / OpenOCD, STM32H723)",
+      "type": "cortex-debug",
+      "request": "launch",
+      "servertype": "openocd",
+      "cwd": "${workspaceFolder}",
+      "executable": "${workspaceFolder}/MDK-ARM/h723_cloud/h723_cloud.axf",
+      "device": "STM32H723ZG",
+      "configFiles": [
+        "interface/stlink.cfg",
+        "target/stm32h7x.cfg"
+      ],
+      "gdbPath": "arm-none-eabi-gdb",
+      "svdFile": "D:/DevEnv/ST/STM32CubeCLT_1.18.0/STMicroelectronics_CMSIS_SVD/STM32H723.svd",
+      "runToEntryPoint": "main"
+    }
+  ]
+}

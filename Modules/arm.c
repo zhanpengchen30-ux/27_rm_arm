@@ -151,6 +151,12 @@ volatile uint8_t g_snap_cmd   = 0u;   /* 1=存当前姿态 2=清除 3=走到该�
 static float    home_goal[ARM_JOINT_NUM];
 static uint8_t  home_hold = 0;
 static uint32_t home_deadline = 0;
+/* 反馈断流宽限。2026-11-23 13:26 实测：断流中位 0.25s、99% 在 0.65s 内，
+   128s 里 229 次。断流期间 cmd_smooth 已经冻结不前进，没必要因一拍丢帧
+   就放弃整段 HOME、回保持态把跟随锁死；连续丢够这么久才判故障，
+   截止时间照旧兜底。 */
+#define ARM_HOME_FB_GRACE_MS 800u
+static uint32_t home_fb_lost_ms = 0;   /* 首次发现反馈变差的时刻；0=正常 */
 
 /* 命令码 3 = 主手按键发来的 500ms 脉冲：一键循环 工作位→轨迹首点→回放。
    每段到位按电机实际位置进容差并连续保持判定，比按指令位置判更准。 */
@@ -324,12 +330,12 @@ static void Arm_InterpResetAll(void)
 }
 
 /* 主从方向：-1 表示该轴主手增量取反后再映射到从手。
-   历史实测：2026-11-22 12:28 相关系数 J1 +0.83 / J2 -0.88 / J3 -0.79 /
-   J4 +0.94 / J5 -0.91 / J6 +0.92；14:09 把 J4、J5 翻反后 J4 掉到 -0.42、
-   J5 变 +0.17，跟随明显变差。
-   2026-11-22 现场最终确认：J6 = -1（用户两次反馈 J6 反了，以现场为准，
-   覆盖 12:28 的相关系数记录）；J4 = -1（19:20 改）。
-   方向以现场手动推主手看同向为准；若需临时翻转，用 g_dir_sign 立即生效、无需重烧。 */
+   2026-11-23 固化：用户逐轴现场验证认可的净方向表 = {+,-,-,-,+,+}。
+   推导：上一版编译期表 {+,-,-,+,-,+} 叠加运行时 g_dir_sign {+,+,+,-,-,+}
+   得到净方向 {+,-,-,-,+,+}，即 J2/J3/J4 取反、J1/J5/J6 同向，用户确认手感最佳。
+   注意：主手个别轴机械/编码器方向与物理推手方向相反，用 target_joint 数值
+   算增量同向率会给出相反结论；方向对错以现场操作者体感为准。
+   若现场仍看到某轴反向，用 g_dir_sign 逐轴翻转立即生效，确认后再改这张表。 */
 static const float ARM_DIR[ARM_JOINT_NUM] = {
     1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f
 };
@@ -768,12 +774,17 @@ static void Arm_UpdateState(void)
  * 惯性，表现为过冲 + 回抽。开减速带后按剩余距离提前收速 v<=sqrt(2*a*d)。
  * g_decel_en=0 时逐拍结果与改动前完全一致；g_slew_max_rad_s 默认 3.0 也等于
  * 原来写死的 ARM_MAX_STEP，两个开关都能单独退回旧行为做对照。
- * 2026-11-22：默认上限 3.0 -> 4.0（提高跟随速度）；SaneF 允许 0.1~6.0。
+ * 2026-11-22 20:09 曾把默认上限提到 4.0；2026-11-23 回到 12:28 那版的 3.0，
+ * 要更快在 Watch 里往上试（SaneF 允许 0.1~6.0）。
  * ======================================================================== */
-volatile float   g_slew_max_rad_s = 4.0f;                /* 跟随速度上限(rad/s) */
+/* 2026-11-23 固化：slew 3→5、gain 0→2（用户实测"比之前好"的认可版）。
+   历史：slew 3→4→5 逐步提速，5 是用户确认的合适值；
+   gain 实测 5 会因 fabs(误差)前馈过冲引入 0.33° 振荡，2 才平静且能补"蹭到位"；
+   vel_min 曾试 0.1 导致 J1 重力下沉，已恢复 0.4。 */
+volatile float   g_slew_max_rad_s = 5.0f;                /* 跟随速度上限(rad/s) */
 volatile float   g_decel_rad_s2   = 20.0f;               /* 减速带加速度(rad/s^2) */
 volatile uint8_t g_decel_en       = 0;                   /* 0=旧行为 1=开减速带 */
-volatile float   g_trk_vel_gain   = 0.0f;                /* vmag 追赶增益，0=旧行为 */
+volatile float   g_trk_vel_gain   = 2.0f;                /* vmag 追赶增益，0=旧行为 */
 /* 关节 vmag 的下限(rad/s)：静止时仍给内环一点速度余量，防止重力缓慢下沉。
    怀疑静止抖动来自这个常值速度时，可在 Watch 里往 0.1 试。 */
 volatile float   g_trk_vel_min    = 0.4f;
@@ -1352,8 +1363,13 @@ static void Teach_FlashLoad(void)
 #define ARM_SLOT_ARRIVE_TOL   0.03f     /* 单轴到位容差(rad) */
 #define ARM_SLOT_HOLD_TICKS   50u       /* 到位后连续保持 100ms 才算数 */
 #define ARM_SLOT_OPEN_MS      500u      /* 放矿位张爪保持时间 */
-#define ARM_SLOT_WORK_TOL     0.05f     /* 判断"已经在标准交接位"的容差，可省一步 */
 #define ARM_SLOT_SETTLE_TOL   0.02f     /* 录点位时实测与指令的最大差(臂必须静止) */
+/* 工作位/收纳位/HOME 的到位判据不能按零静差算：达妙 PVT 静止时有
+   0.03~0.1rad 位置环静差，g_trk_vel_min=0.4 时 J2 某些姿态还会激起
+   40~65mrad 极限环。按 0.03 判会时到不了 → HOME 超时回保持、跟随再也
+   吸合不上，表现就是"有概率卡住"。改成"指令已到点 + 实测静差有上限"。 */
+#define ARM_SLOT_CMD_TOL      0.005f    /* 指令到点容差(rad) */
+#define ARM_SLOT_SAG_TOL      0.10f     /* 静止静差上限(rad)，超了当被挡住 */
 
 #define ARM_SLOT_ST_IDLE      0u
 #define ARM_SLOT_ST_GO_WORK   1u        /* 先回到工作位 */
@@ -1553,7 +1569,8 @@ static uint8_t Arm_SlotAtWorkPose(void)
     {
         DM_Motor_t *m = DM_Motor_Get(i);
         if(m == NULL || !Arm_FbFresh(m)) return 0u;
-        if(fabsf(m->position - g_deploy_pos[i]) > ARM_SLOT_WORK_TOL) return 0u;
+        if(fabsf(arm.cmd_smooth[i] - g_deploy_pos[i]) > ARM_SLOT_CMD_TOL ||
+           fabsf(m->position - g_deploy_pos[i]) > ARM_SLOT_SAG_TOL) return 0u;
     }
     return 1u;
 }
@@ -2090,7 +2107,8 @@ static uint8_t Arm_StowAtPose(void)
     {
         DM_Motor_t *m = DM_Motor_Get(i);
         if(m == NULL || !Arm_FbFresh(m)) return 0u;
-        if(fabsf(m->position - g_stow_pos[i]) > ARM_SLOT_WORK_TOL) return 0u;
+        if(fabsf(arm.cmd_smooth[i] - g_stow_pos[i]) > ARM_SLOT_CMD_TOL ||
+           fabsf(m->position - g_stow_pos[i]) > ARM_SLOT_SAG_TOL) return 0u;
     }
     return 1u;
 }
@@ -2163,6 +2181,7 @@ static void Arm_HomeStartPose(const volatile float *pose, uint8_t st)
     if(est < 2000u) est = 2000u;
     home_deadline = HAL_GetTick() + est * 3u;
     home_hold = 0;
+    home_fb_lost_ms = 0u;
     g_home_err = 0u;
     g_home_state = st;
 }
@@ -2241,10 +2260,18 @@ static void Arm_HomeTick(void)
     }
     if(!Arm_SlotFbOk())
     {
-        g_home_state = ARM_HOME_HOLD_WORK;
-        g_home_err = 3u;
+        uint32_t now = HAL_GetTick();
+        if(home_fb_lost_ms == 0u) home_fb_lost_ms = (now != 0u) ? now : 1u;
+        else if((uint32_t)(now - home_fb_lost_ms) >= ARM_HOME_FB_GRACE_MS)
+        {
+            home_fb_lost_ms = 0u;
+            g_home_state = ARM_HOME_HOLD_WORK;
+            g_home_err = 3u;
+        }
+        home_hold = 0;
         return;
     }
+    home_fb_lost_ms = 0u;
     if((int32_t)(HAL_GetTick() - home_deadline) >= 0)
     {
         g_home_state = ARM_HOME_HOLD_WORK;
@@ -2256,7 +2283,8 @@ static void Arm_HomeTick(void)
     {
         DM_Motor_t *m = DM_Motor_Get(i);
         if(m == NULL || !Arm_FbFresh(m) ||
-           fabsf(m->position - home_goal[i]) > ARM_SLOT_ARRIVE_TOL) { all_at = 0u; break; }
+           fabsf(arm.cmd_smooth[i] - home_goal[i]) > ARM_SLOT_CMD_TOL ||
+           fabsf(m->position - home_goal[i]) > ARM_SLOT_SAG_TOL) { all_at = 0u; break; }
     }
     if(!all_at) { home_hold = 0; return; }
     if(++home_hold < ARM_SLOT_HOLD_TICKS) return;
@@ -2492,8 +2520,8 @@ void Arm_ControlLoop(void)
     Arm_SaneF(&g_grip_cur,    0.0f,  1.0f,  0.9f);
     Arm_SaneF(&g_deploy_speed, 0.05f, 3.0f, 0.5f);
     Arm_SaneF(&g_teach_speed,  0.2f,  2.0f, 1.0f);
-    Arm_SaneF(&g_slew_max_rad_s, 0.1f,  6.0f,  4.0f);
-    Arm_SaneF(&g_trk_vel_gain,   0.0f, 20.0f,  0.0f);
+    Arm_SaneF(&g_slew_max_rad_s, 0.1f,  6.0f,  5.0f);
+    Arm_SaneF(&g_trk_vel_gain,   0.0f, 20.0f,  2.0f);
     Arm_SaneF(&g_trk_vel_min,    0.0f,  1.5f,  0.4f);
     Arm_SaneF(&g_decel_rad_s2,   1.0f, 80.0f, 20.0f);
     for(int i = 0; i < ARM_JOINT_NUM; i++)
